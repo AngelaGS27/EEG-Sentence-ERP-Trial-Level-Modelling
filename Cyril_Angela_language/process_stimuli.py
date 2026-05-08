@@ -385,6 +385,19 @@ def add_cloze_metrics(out: pd.DataFrame) -> pd.DataFrame:
             out[llm_cp_col],
             errors="coerce",
         )
+
+    elif "target_surprisal_bits" in out.columns:
+        # Convert GPT-2 target-word surprisal back into a model-derived
+        # cloze-probability-like expectancy score.
+        #
+        # surprisal = -log2(P(target | context))
+        # therefore:
+        # P(target | context) = 2 ** (-surprisal)
+        out["llm_cp"] = 2 ** (
+            -pd.to_numeric(out["target_surprisal_bits"], errors="coerce")
+        )
+
+    if "llm_cp" in out.columns:
         out["z_llm_cp"] = zscore(out["llm_cp"])
         out["llm_unexpectedness"] = 1 - out["llm_cp"]
 
