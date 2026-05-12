@@ -34,3 +34,5 @@ language_outputs/
 eeg_outputs/
 analysis_optional/
 other_unrelated/
+from_colab/
+erps/

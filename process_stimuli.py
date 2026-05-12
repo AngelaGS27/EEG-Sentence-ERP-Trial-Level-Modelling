@@ -48,7 +48,10 @@ log = logging.getLogger(__name__)
 # ---------------------------------------------------------------------
 
 TEXT_COLUMN_CANDIDATES = [
+    "sentence_for_metrics",
+    "full_sentence",
     "sentence",
+    "sentential_context",
     "sent",
     "sentence_text",
     "stimulus_sentence",
@@ -60,10 +63,12 @@ TEXT_COLUMN_CANDIDATES = [
     "context_sentence",
     "word_sentence",
     "sentence_full",
-    "full_sentence",
 ]
 
 TARGET_COLUMN_CANDIDATES = [
+    "target_word_for_metrics",
+    "key",
+    "known_word",
     "critical_word",
     "target_word",
     "target",
@@ -78,6 +83,8 @@ TARGET_COLUMN_CANDIDATES = [
 ]
 
 CONTEXT_COLUMN_CANDIDATES = [
+    "context_for_metrics",
+    "sentential_context",
     "context",
     "sentence_context",
     "preceding_context",
@@ -187,6 +194,10 @@ def is_probably_real_word(value: Any) -> bool:
     if word in {"nan", "none", "null"}:
         return False
 
+    # Reject phrases or sentence fragments.
+    if len(word.split()) != 1:
+        return False
+
     # Reject pure numbers, punctuation, percentages, ranges, etc.
     if re.fullmatch(r"[\d\W_]+", word):
         return False
@@ -197,8 +208,16 @@ def is_probably_real_word(value: Any) -> bool:
     if re.fullmatch(r"\d+\s*-\s*\d+", word):
         return False
 
+    # Reject stimulus/audio/file IDs
+    if re.fullmatch(r"sound\d+", word):
+        return False
+
+    # Reject one-letter targets unless they are real meaningful English words.
+    if len(word) == 1 and word not in {"a", "i"}:
+        return False
+
     # Allow normal alphabetic words and hyphenated words.
-    if re.search(r"[a-zA-Z]", word):
+    if re.fullmatch(r"[a-zA-Z]+(-[a-zA-Z]+)?", word):
         return True
 
     return False
@@ -210,7 +229,25 @@ def target_column_quality(series: pd.Series) -> float:
     if len(non_null) == 0:
         return 0.0
 
-    sample = non_null.head(100)
+    sample = non_null.head(100).astype(str)
+
+    # Reject columns that are mostly phrases/sentence fragments.
+    phrase_rate = sample.str.strip().str.split().apply(len).gt(1).mean()
+
+    if phrase_rate > 0.20:
+        return 0.0
+
+    # Reject columns that look like stimulus IDs.
+    sound_id_rate = sample.str.lower().str.strip().str.match(r"^sound\d+$").mean()
+
+    if sound_id_rate > 0.20:
+        return 0.0
+
+    # Reject columns where many values are one-letter fragments.
+    one_letter_rate = sample.str.strip().str.len().eq(1).mean()
+
+    if one_letter_rate > 0.20:
+        return 0.0
 
     return sample.apply(is_probably_real_word).mean()
 
@@ -305,16 +342,30 @@ def detect_text_column(df: pd.DataFrame) -> Optional[str]:
 
 
 def detect_target_column(df: pd.DataFrame) -> Optional[str]:
+    """
+    The target column should contain single target words, not full sentences,
+    contexts, stimulus IDs, metadata, or condition labels.
+    """
+
+    text_col = detect_text_column(df)
+    context_col = detect_context_column(df)
+    condition_col = detect_condition_column(df)
+
+    excluded_cols = {
+        col for col in [text_col, context_col, condition_col]
+        if col is not None
+    }
+
     direct = find_column(df, TARGET_COLUMN_CANDIDATES)
 
-    if direct is not None:
+    if direct is not None and direct not in excluded_cols:
         quality = target_column_quality(df[direct])
 
-        if quality >= 0.50:
+        if quality >= 0.70:
             return direct
 
         log.warning(
-            "Rejected target column '%s' because values do not look like real words. Quality = %.2f",
+            "Rejected target column '%s' because values do not look like single target words. Quality = %.2f",
             direct,
             quality,
         )
@@ -323,7 +374,14 @@ def detect_target_column(df: pd.DataFrame) -> Optional[str]:
     best_quality = 0.0
 
     for col in df.columns:
+        if col in excluded_cols:
+            continue
+
         if pd.api.types.is_numeric_dtype(df[col]):
+            continue
+
+        # Never allow columns that look like sentence/context columns.
+        if looks_like_text_column(df[col]):
             continue
 
         quality = target_column_quality(df[col])
@@ -335,6 +393,8 @@ def detect_target_column(df: pd.DataFrame) -> Optional[str]:
     if best_col is not None and best_quality >= 0.70:
         return best_col
 
+    # If no reliable target column is found, return None.
+    # Then process_table() will derive the target as the final word of the sentence.
     return None
 
 
@@ -352,9 +412,10 @@ def detect_context_column(df: pd.DataFrame) -> Optional[str]:
 # ---------------------------------------------------------------------
 
 HUMAN_CP_COLUMN_CANDIDATES = [
+    "cloze_probability",
+    "cloze-probability%_div",
     "human_cloze_probability",
     "human_cp",
-    "cloze_probability",
     "cloze",
     "cp",
 ]
@@ -496,6 +557,11 @@ def should_skip_file(path: Path) -> bool:
     name = path.name.lower()
     full = str(path).lower()
 
+    # Skip cloze-survey metadata JSON.
+    # This file describes the task; it is not a trial/stimulus table.
+    if name.endswith("cloze-probability-survey.json"):
+        return True
+
     if any(pattern in name for pattern in EXCLUDE_FILE_PATTERNS):
         return True
 
@@ -512,12 +578,14 @@ def should_skip_file(path: Path) -> bool:
 
 
 def find_data_files(path: Path) -> list[Path]:
-    allowed = {".csv", ".tsv", ".json"}
+    allowed_names = {
+        "n400stimset_cloze-probability-survey_results.tsv",
+        "n400stimset_stimuli_parameters.tsv",
+    }
 
     if path.is_file():
-        if path.suffix.lower() in allowed and not should_skip_file(path):
+        if path.name.lower() in allowed_names and not should_skip_file(path):
             return [path]
-
         return []
 
     files = []
@@ -526,8 +594,13 @@ def find_data_files(path: Path) -> list[Path]:
         for name in names:
             p = Path(root) / name
 
-            if p.suffix.lower() in allowed and not should_skip_file(p):
-                files.append(p)
+            if p.name.lower() not in allowed_names:
+                continue
+
+            if should_skip_file(p):
+                continue
+
+            files.append(p)
 
     return sorted(files)
 
@@ -605,6 +678,63 @@ def validate_detected_table(
 
     return True
 
+def prepare_n400_specific_columns(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+
+    # Cloze survey results:
+    # sentential_context = context shown to participant
+    # key = expected completion
+    if "sentential_context" in df.columns and "key" in df.columns:
+        df["context_for_metrics"] = df["sentential_context"].astype(str).str.strip()
+        df["target_word_for_metrics"] = df["key"].astype(str).map(clean_word)
+        df["sentence_for_metrics"] = (
+            df["context_for_metrics"].astype(str).str.rstrip()
+            + " "
+            + df["target_word_for_metrics"].astype(str).str.strip()
+        )
+
+    # Stimuli parameters:
+    # columns 1-8 are the actual presented sentence words.
+    # The target is the actual final word in the presented sentence.
+    numbered_cols = [
+        col for col in df.columns
+        if str(col).strip().isdigit()
+    ]
+
+    if numbered_cols:
+        numbered_cols = sorted(numbered_cols, key=lambda x: int(str(x).strip()))
+
+        sentences = []
+
+        for _, row in df.iterrows():
+            words = []
+
+            for col in numbered_cols:
+                value = row[col]
+
+                if pd.isna(value):
+                    continue
+
+                value = str(value).strip()
+
+                if value and value.lower() != "nan":
+                    words.append(value)
+
+            sentence = " ".join(words).strip()
+            sentences.append(sentence)
+
+        df["sentence_for_metrics"] = sentences
+        df["target_word_for_metrics"] = df["sentence_for_metrics"].map(derive_final_word)
+
+        df["context_for_metrics"] = [
+            derive_context(sentence, target)
+            for sentence, target in zip(
+                df["sentence_for_metrics"],
+                df["target_word_for_metrics"],
+            )
+        ]
+
+    return df
 
 def process_table(
     df: pd.DataFrame,
@@ -617,6 +747,8 @@ def process_table(
     if df.empty:
         log.warning("Skipping empty file: %s", source_file)
         return None
+
+    df = prepare_n400_specific_columns(df)
 
     text_col = detect_text_column(df)
     target_col = detect_target_column(df)
