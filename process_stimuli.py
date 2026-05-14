@@ -509,12 +509,44 @@ def add_emotion_features(out: pd.DataFrame, idx: int, target: str) -> None:
 # ---------------------------------------------------------------------
 
 def save_predictor_diagnostics(df: pd.DataFrame, output_prefix: Path) -> None:
-    numeric = df.select_dtypes(include=[np.number]).copy()
+    diagnostic_predictors = [
+        "human_cp",
+        "llm_cp",
+        "target_surprisal_bits",
+        "context_target_similarity",
+        "target_zipf_frequency",
+        "target_n_letters",
+        "target_n_phonemes",
+        "target_n_syllables",
+        "syntax_mean_dependency_distance",
+        "syntax_max_parse_depth",
+        "syntax_n_subordinate_clauses",
+        "target_valence",
+        "target_arousal",
+    ]
+
+    available = [
+        col for col in diagnostic_predictors
+        if col in df.columns
+    ]
+
+    if len(available) < 2:
+        log.warning(
+            "Not enough diagnostic predictors available: %s",
+            output_prefix,
+        )
+        return
+
+    numeric = df[available].copy()
+    numeric = numeric.apply(pd.to_numeric, errors="coerce")
     numeric = numeric.dropna(axis=1, how="all")
+
+    # Remove constant columns because they break correlations/VIF.
+    numeric = numeric.loc[:, numeric.std(skipna=True) != 0]
 
     if numeric.shape[1] < 2:
         log.warning(
-            "Not enough numeric predictors for diagnostics: %s",
+            "Not enough non-constant numeric predictors for diagnostics: %s",
             output_prefix,
         )
         return
@@ -547,6 +579,7 @@ def save_predictor_diagnostics(df: pd.DataFrame, output_prefix: Path) -> None:
     vif_df.to_csv(str(output_prefix) + "_vif.csv", index=False)
 
     log.info("Saved diagnostics: %s", output_prefix)
+    log.info("Diagnostic predictors used: %s", list(numeric.columns))
 
 
 # ---------------------------------------------------------------------
