@@ -616,24 +616,24 @@ def find_data_files(path: Path) -> list[Path]:
         "n400stimset_stimuli_parameters.tsv",
     }
 
+    path = Path(path)
+
+    # If a single file was passed directly.
     if path.is_file():
-        if path.name.lower() in allowed_names and not should_skip_file(path):
+        if path.name.lower() in allowed_names:
             return [path]
         return []
 
     files = []
 
+    # Recursively search the folder.
     for root, _, names in os.walk(path):
         for name in names:
             p = Path(root) / name
 
-            if p.name.lower() not in allowed_names:
-                continue
-
-            if should_skip_file(p):
-                continue
-
-            files.append(p)
+            # Only allow the two real N400 stimulus tables.
+            if p.name.lower() in allowed_names:
+                files.append(p)
 
     return sorted(files)
 
