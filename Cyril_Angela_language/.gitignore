@@ -35,4 +35,4 @@ eeg_outputs/
 analysis_optional/
 other_unrelated/
 from_colab/
-erps/
+erps_only_.mat/
