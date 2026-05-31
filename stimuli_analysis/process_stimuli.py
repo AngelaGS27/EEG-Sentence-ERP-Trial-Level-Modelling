@@ -554,7 +554,10 @@ def save_predictor_diagnostics(df: pd.DataFrame, output_prefix: Path) -> None:
     numeric = numeric.fillna(numeric.mean())
 
     corr = numeric.corr()
-    corr.to_csv(str(output_prefix) + "_correlations.csv")
+    corr.to_csv(
+        str(output_prefix) + "_correlations.tsv",
+        sep="\t"
+    )
 
     vif_rows = []
 
@@ -576,7 +579,11 @@ def save_predictor_diagnostics(df: pd.DataFrame, output_prefix: Path) -> None:
         ascending=False,
     )
 
-    vif_df.to_csv(str(output_prefix) + "_vif.csv", index=False)
+    vif_df.to_csv(
+        str(output_prefix) + "_vif.tsv",
+        sep="\t",
+        index=False
+    )
 
     log.info("Saved diagnostics: %s", output_prefix)
     log.info("Diagnostic predictors used: %s", list(numeric.columns))
@@ -957,7 +964,7 @@ def process_table(
 def safe_output_name(path: Path) -> str:
     stem = re.sub(r"[^A-Za-z0-9_.-]+", "_", path.stem)
 
-    return stem + "_language_metrics.csv"
+    return stem + "_language_metrics.tsv"
 
 
 # ---------------------------------------------------------------------
@@ -1058,11 +1065,6 @@ def main() -> None:
         if result is None:
             continue
 
-        output_path = output_dir / safe_output_name(file_path)
-        result.to_csv(output_path, index=False)
-
-        log.info("Saved: %s", output_path)
-
         diagnostics_prefix = output_dir / safe_output_name(file_path).replace(
             "_language_metrics.csv",
             "_predictor_diagnostics",
@@ -1076,8 +1078,8 @@ def main() -> None:
     if all_results:
         combined = pd.concat(all_results, ignore_index=True)
 
-        combined_output = output_dir / "ALL_language_metrics.csv"
-        combined.to_csv(combined_output, index=False)
+        combined_output = output_dir / "ALL_language_metrics.tsv"
+        combined.to_csv(combined_output, sep="\t", index=False)
 
         log.info("Saved combined output: %s", combined_output)
 
