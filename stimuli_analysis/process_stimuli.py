@@ -7,6 +7,7 @@ import os
 import re
 from pathlib import Path
 from typing import Optional, Any
+import statsmodels.api as sm
 
 import numpy as np
 import pandas as pd
@@ -488,6 +489,9 @@ def save_predictor_diagnostics(df: pd.DataFrame, output_prefix: Path) -> None:
 
     numeric = numeric.fillna(numeric.mean())
 
+    numeric = (numeric - numeric.mean()) / numeric.std()
+    numeric = sm.add_constant(numeric)
+
     corr = numeric.corr()
     corr.to_csv(
         str(output_prefix) + "_correlations.tsv",
@@ -497,6 +501,9 @@ def save_predictor_diagnostics(df: pd.DataFrame, output_prefix: Path) -> None:
     vif_rows = []
 
     for i, col in enumerate(numeric.columns):
+        if col == "const":
+            continue
+
         try:
             vif = variance_inflation_factor(numeric.values, i)
         except Exception:

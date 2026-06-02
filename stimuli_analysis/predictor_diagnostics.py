@@ -2,7 +2,7 @@ import argparse
 import pandas as pd
 import numpy as np
 from statsmodels.stats.outliers_influence import variance_inflation_factor
-
+import statsmodels.api as sm
 
 def main():
     parser = argparse.ArgumentParser()
@@ -52,12 +52,18 @@ def main():
 
     numeric = numeric.fillna(numeric.mean())
 
+    numeric = (numeric - numeric.mean()) / numeric.std()
+    numeric = sm.add_constant(numeric)
+
     corr = numeric.corr()
     corr.to_csv(args.output_prefix + "_correlations.tsv", sep="\t")
 
     vif_rows = []
 
     for i, col in enumerate(numeric.columns):
+        if col == "const":
+            continue
+
         try:
             vif = variance_inflation_factor(numeric.values, i)
         except Exception:

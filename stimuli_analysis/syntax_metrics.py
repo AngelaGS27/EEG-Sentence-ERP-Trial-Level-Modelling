@@ -35,7 +35,7 @@ def compute_syntax(sentence, nlp):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("input_csv")
+    parser.add_argument("input_tsv")
     parser.add_argument("--text-col", default="sentence")
     parser.add_argument("--output", default="language_outputs/syntax_metrics.tsv")
     parser.add_argument("--model", default="en_core_web_sm")
