@@ -61,6 +61,23 @@ def add_cloze_metrics(out: pd.DataFrame) -> pd.DataFrame:
             out[human_cp_col],
             errors="coerce",
         )
+
+        out["context_constraint_human_cp"] = out["human_cp"]
+
+        if "known_word" in out.columns and "target_word_used" in out.columns:
+            out["target_matches_expected_word"] = (
+                out["target_word_used"].astype(str).str.lower().str.strip()
+                == out["known_word"].astype(str).str.lower().str.strip()
+            )
+
+            out["actual_target_human_cp"] = out["human_cp"].where(
+                out["target_matches_expected_word"],
+                np.nan,
+            )
+        else:
+            out["target_matches_expected_word"] = np.nan
+            out["actual_target_human_cp"] = out["human_cp"]
+
         out["z_human_cp"] = zscore(out["human_cp"])
         out["human_unexpectedness"] = 1 - out["human_cp"]
 
@@ -80,11 +97,17 @@ def add_cloze_metrics(out: pd.DataFrame) -> pd.DataFrame:
         out["llm_unexpectedness"] = 1 - out["llm_cp"]
 
     if "human_cp" in out.columns and "llm_cp" in out.columns:
-        out["cp_difference_human_minus_llm"] = (
-            out["human_cp"] - out["llm_cp"]
+        out["context_constraint_minus_llm_target_probability"] = (
+            out["context_constraint_human_cp"] - out["llm_cp"]
         )
-        out["abs_cp_disagreement"] = (
-            out["cp_difference_human_minus_llm"].abs()
+
+        out["abs_context_constraint_llm_disagreement"] = (
+            out["context_constraint_minus_llm_target_probability"].abs()
+        )
+
+    if "actual_target_human_cp" in out.columns and "llm_cp" in out.columns:
+        out["actual_target_cp_minus_llm"] = (
+            out["actual_target_human_cp"] - out["llm_cp"]
         )
 
     return out
