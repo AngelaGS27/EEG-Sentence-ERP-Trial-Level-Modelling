@@ -31,6 +31,8 @@ env/
 *.asv
 
 language_outputs/
+language_outputs_old/
+limo_tools/
 eeg_outputs/
 analysis_optional/
 other_unrelated/
