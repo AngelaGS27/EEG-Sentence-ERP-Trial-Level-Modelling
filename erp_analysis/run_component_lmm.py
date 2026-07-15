@@ -323,25 +323,68 @@ def select_component_rows(chunk: pd.DataFrame, component: str) -> pd.DataFrame:
     return named
 
 
-def load_predictors(path: Path) -> pd.DataFrame:
-    pred = pd.read_csv(path)
+def load_predictors(
+    path: Path,
+) -> pd.DataFrame:
+    """
+    Load and validate language predictors from CSV or TSV.
 
-    pred.columns = [safe_name(c) for c in pred.columns]
+    stim_key is required because trial number is not a stable
+    cross-subject stimulus identifier.
+    """
 
-    if "item" not in pred.columns and "sentence_id" in pred.columns:
-        pred["item"] = pred["sentence_id"]
+    pred = pd.read_csv(
+        path,
+        sep=None,
+        engine="python",
+    )
 
-    if "trial" not in pred.columns and "sentence_id" in pred.columns:
-        pred["trial"] = pred["sentence_id"]
+    pred.columns = [
+        safe_name(column)
+        for column in pred.columns
+    ]
 
-    if "item" in pred.columns:
-        pred["item"] = pd.to_numeric(pred["item"], errors="coerce")
+    if "stim_key" not in pred.columns:
+        raise ValueError(
+            "Predictor table must contain 'stim_key'."
+        )
 
-    if "trial" in pred.columns:
-        pred["trial"] = pd.to_numeric(pred["trial"], errors="coerce")
+    pred["stim_key"] = (
+        pred["stim_key"]
+        .astype("string")
+        .str.strip()
+    )
+
+    if pred["stim_key"].isna().any():
+        raise ValueError(
+            "Predictor table contains "
+            f"{pred['stim_key'].isna().sum()} "
+            "missing stim_key values."
+        )
+
+    duplicated = pred[
+        "stim_key"
+    ].duplicated(
+        keep=False
+    )
+
+    if duplicated.any():
+        examples = (
+            pred.loc[
+                duplicated,
+                "stim_key",
+            ]
+            .drop_duplicates()
+            .head(10)
+            .tolist()
+        )
+
+        raise ValueError(
+            "Predictor table contains duplicate "
+            f"stim_key values. Examples: {examples}"
+        )
 
     return pred
-
 
 def component_average_chunked(
     erp_long_path: Path,
@@ -349,21 +392,18 @@ def component_average_chunked(
     chunksize: int = 1_000_000,
 ) -> pd.DataFrame:
     """
-    Compute component mean amplitude without loading the full ERP table.
+    Compute component mean amplitude from retained ERP trials.
 
-    Uses:
-        1. component time window
-        2. named ROI labels
-        3. coordinate-based ROI fallback when names are incomplete
+    Each retained subject/condition/trial remains a separate observation.
     """
 
-    y = f"{component}_amplitude"
+    outcome = f"{component}_amplitude"
 
-    required_cols = [
+    required_columns = [
         "subject",
         "condition",
-        "trial",
-        "item",
+        "retained_trial",
+        "stim_key",
         "channel",
         "time",
         "amplitude",
@@ -371,90 +411,231 @@ def component_average_chunked(
 
     partials = []
 
-    log.info("Computing %s average from %s", component, erp_long_path)
+    log.info(
+        "Computing %s average from %s",
+        component,
+        erp_long_path,
+    )
 
     for chunk_number, chunk in enumerate(
-        pd.read_csv(erp_long_path, chunksize=chunksize),
+        pd.read_csv(
+            erp_long_path,
+            chunksize=chunksize,
+        ),
         start=1,
     ):
-        missing = [c for c in required_cols if c not in chunk.columns]
+        missing_columns = [
+            column
+            for column in required_columns
+            if column not in chunk.columns
+        ]
 
-        if missing:
+        if missing_columns:
             raise ValueError(
-                f"ERP file is missing required columns: {missing}"
+                "ERP file is missing required "
+                f"columns: {missing_columns}"
             )
 
-        chunk["channel"] = chunk["channel"].map(normalise_channel_name)
-        chunk["time"] = pd.to_numeric(chunk["time"], errors="coerce")
-        chunk["amplitude"] = pd.to_numeric(chunk["amplitude"], errors="coerce")
+        chunk["stim_key"] = (
+            chunk["stim_key"]
+            .astype("string")
+            .str.strip()
+        )
 
-        sub = select_component_rows(
+        if chunk["stim_key"].isna().any():
+            raise ValueError(
+                "ERP long file contains missing stim_key values."
+            )
+
+        chunk["channel"] = (
+            chunk["channel"]
+            .map(
+                normalise_channel_name
+            )
+        )
+
+        chunk["time"] = pd.to_numeric(
+            chunk["time"],
+            errors="coerce",
+        )
+
+        chunk["amplitude"] = pd.to_numeric(
+            chunk["amplitude"],
+            errors="coerce",
+        )
+
+        selected = select_component_rows(
             chunk=chunk,
             component=component,
         )
 
-        if sub.empty:
+        if selected.empty:
             continue
 
+        group_columns = [
+            "subject",
+            "condition",
+            "retained_trial",
+            "stim_key",
+        ]
+
+        optional_columns = [
+            "condition_label",
+            "trial_type",
+            "stim_file",
+            "original_event_row",
+            "experimental_trial",
+            "urevent_index",
+        ]
+
+        group_columns.extend(
+            [
+                column
+                for column in optional_columns
+                if column in selected.columns
+            ]
+        )
+
         grouped = (
-            sub.groupby(
-                ["subject", "condition", "item", "trial"],
+            selected
+            .groupby(
+                group_columns,
                 as_index=False,
+                dropna=False,
             )
             .agg(
-                amplitude_sum=("amplitude", "sum"),
-                amplitude_n=("amplitude", "count"),
+                amplitude_sum=(
+                    "amplitude",
+                    "sum",
+                ),
+                amplitude_n=(
+                    "amplitude",
+                    "count",
+                ),
             )
         )
 
-        partials.append(grouped)
+        partials.append(
+            grouped
+        )
 
         if chunk_number % 10 == 0:
-            log.info("Processed %d ERP chunks", chunk_number)
+            log.info(
+                "Processed %d ERP chunks",
+                chunk_number,
+            )
 
     if not partials:
         raise ValueError(
             f"No ERP rows found for component {component}. "
-            f"Check time units, channel labels, and coordinate columns."
+            "Check the time units, channel labels and coordinates."
         )
 
-    all_partial = pd.concat(partials, ignore_index=True)
+    all_partial = pd.concat(
+        partials,
+        ignore_index=True,
+    )
+
+    final_group_columns = [
+        column
+        for column in all_partial.columns
+        if column
+        not in {
+            "amplitude_sum",
+            "amplitude_n",
+        }
+    ]
 
     final = (
-        all_partial.groupby(
-            ["subject", "condition", "item", "trial"],
+        all_partial
+        .groupby(
+            final_group_columns,
             as_index=False,
+            dropna=False,
         )
         .agg(
-            amplitude_sum=("amplitude_sum", "sum"),
-            amplitude_n=("amplitude_n", "sum"),
+            amplitude_sum=(
+                "amplitude_sum",
+                "sum",
+            ),
+            amplitude_n=(
+                "amplitude_n",
+                "sum",
+            ),
         )
     )
 
-    final[y] = final["amplitude_sum"] / final["amplitude_n"]
+    final[outcome] = (
+        final["amplitude_sum"]
+        / final["amplitude_n"]
+    )
 
-    final = final.drop(columns=["amplitude_sum", "amplitude_n"])
+    final = final.drop(
+        columns=[
+            "amplitude_sum",
+            "amplitude_n",
+        ]
+    )
 
-    log.info("Computed %s averages: %d rows", component, len(final))
+    log.info(
+        "Computed %s averages: %d retained trials",
+        component,
+        len(final),
+    )
 
     return final
 
 
-def choose_merge_keys(comp: pd.DataFrame, pred: pd.DataFrame) -> list[str]:
-   
-    keys = []
+def choose_merge_keys(
+    comp: pd.DataFrame,
+    pred: pd.DataFrame,
+) -> list[str]:
+    """
+    Require stim_key as the merge key.
+    """
 
-    for key in ["item", "trial", "condition"]:
-        if key in comp.columns and key in pred.columns:
-            keys.append(key)
-
-    if not keys:
+    if "stim_key" not in comp.columns:
         raise ValueError(
-            "No shared merge keys found between ERP and predictors. "
-            "Expected at least item/trial."
+            "ERP component data does not contain stim_key. "
+            "Re-run export_erp_long.py using the stimulus mapping."
         )
 
-    return keys
+    if "stim_key" not in pred.columns:
+        raise ValueError(
+            "Language predictor table does not contain stim_key."
+        )
+
+    if comp["stim_key"].isna().any():
+        raise ValueError(
+            "ERP component data contains missing stim_key values."
+        )
+
+    if pred["stim_key"].isna().any():
+        raise ValueError(
+            "Predictor table contains missing stim_key values."
+        )
+
+    if pred["stim_key"].duplicated().any():
+        examples = (
+            pred.loc[
+                pred["stim_key"].duplicated(
+                    keep=False
+                ),
+                "stim_key",
+            ]
+            .drop_duplicates()
+            .head(10)
+            .tolist()
+        )
+
+        raise ValueError(
+            "Predictor table contains duplicate stim_key values. "
+            f"Examples: {examples}"
+        )
+
+    return [
+        "stim_key"
+    ]
 
 
 def prepare_model_dataframe(
@@ -463,41 +644,132 @@ def prepare_model_dataframe(
     component: str,
     output_dir: Path,
 ) -> pd.DataFrame:
+    """
+    Merge ERP component averages with language predictors using stim_key
+    and validate that every ERP trial receives predictor values.
+    """
+
     y = f"{component}_amplitude"
 
-    merge_keys = choose_merge_keys(comp, pred)
-
-    log.info("Merging component data with predictors on: %s", merge_keys)
-
-    df = comp.merge(pred, on=merge_keys, how="left", suffixes=("", "_pred"))
-
-    available_default_predictors = [
-        p for p in DEFAULT_PREDICTORS if p in df.columns
-    ]
-
-    if available_default_predictors:
-        missing_predictor_rows = (
-            df[available_default_predictors]
-            .isna()
-            .all(axis=1)
-            .sum()
-        )
-    else:
-        missing_predictor_rows = len(df)
-
-    log.info("Merged model rows: %d", len(df))
-    log.info(
-        "Rows with all available default predictors missing: %d",
-        missing_predictor_rows,
+    merge_keys = choose_merge_keys(
+        comp,
+        pred,
     )
 
-    model_data_path = output_dir / f"model_data_{component}.csv"
-    df.to_csv(model_data_path, index=False)
+    log.info(
+        "Merging component data with "
+        "predictors on: %s",
+        merge_keys,
+    )
 
-    log.info("Saved model data: %s", model_data_path)
+    df = comp.merge(
+        pred,
+        on=merge_keys,
+        how="left",
+        suffixes=(
+            "",
+            "_pred",
+        ),
+        validate="many_to_one",
+        indicator=True,
+    )
+
+    unmatched = (
+        df["_merge"] != "both"
+    )
+
+    if unmatched.any():
+        examples = (
+            df.loc[
+                unmatched,
+                "stim_key",
+            ]
+            .drop_duplicates()
+            .head(10)
+            .tolist()
+        )
+
+        raise ValueError(
+            f"{unmatched.sum()} ERP component "
+            "rows could not be matched to "
+            "language predictors. "
+            f"Examples: {examples}"
+        )
+
+    df = df.drop(
+        columns="_merge"
+    )
+
+    available_default_predictors = [
+        predictor
+        for predictor in DEFAULT_PREDICTORS
+        if predictor in df.columns
+    ]
+
+    if not available_default_predictors:
+        raise ValueError(
+            "None of the expected language "
+            "predictors were found after the "
+            "stim_key merge."
+        )
+
+    missing_predictor_rows = (
+        df[
+            available_default_predictors
+        ]
+        .isna()
+        .all(axis=1)
+    )
+
+    if missing_predictor_rows.any():
+        examples = (
+            df.loc[
+                missing_predictor_rows,
+                "stim_key",
+            ]
+            .drop_duplicates()
+            .head(10)
+            .tolist()
+        )
+
+        raise ValueError(
+            f"{missing_predictor_rows.sum()} "
+            "merged rows contain no usable "
+            "predictor values. "
+            f"Examples: {examples}"
+        )
+
+    log.info(
+        "Merged model rows: %d",
+        len(df),
+    )
+
+    log.info(
+        "Unique stimuli in model data: %d",
+        df["stim_key"].nunique(
+            dropna=True
+        ),
+    )
+
+    model_data_path = (
+        output_dir
+        / f"model_data_{component}.csv"
+    )
+
+    df.to_csv(
+        model_data_path,
+        index=False,
+    )
+
+    log.info(
+        "Saved model data: %s",
+        model_data_path,
+    )
 
     if y not in df.columns:
-        raise ValueError(f"Outcome column missing: {y}")
+        raise ValueError(
+            f"Outcome column missing: {y}"
+        )
 
     return df
 
@@ -521,7 +793,6 @@ def select_predictors(df: pd.DataFrame, requested: Optional[list[str]] = None) -
             continue
 
         # Skip non-numeric predictors here.
-        # Categorical predictors are handled separately.
         if not pd.api.types.is_numeric_dtype(df[safe_pred]):
             converted = pd.to_numeric(df[safe_pred], errors="coerce")
 
