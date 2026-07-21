@@ -416,73 +416,79 @@ def build_channel_metadata(
     channel_labels: list[str],
 ) -> pd.DataFrame:
     """
-    Build channel metadata in the same order as the MAT file channels.
+    Build channel metadata directly from channel labels stored
+    inside the ERP MAT file.
 
-    Handles:
-        A1
-        A1_Cz
-        'A1'
-        ch_001 fallback labels
+    The bids_root and subject arguments remain in the signature
+    so that existing calls do not need to be changed.
 
-    Combines:
-        1. labels from the .mat file
-        2. subject channels.tsv
-        3. task-N400Stimset_electrodes.tsv coordinates
     """
 
-    electrodes = load_electrode_coordinates(bids_root)
-    subject_channels = load_subject_channel_metadata(bids_root, subject)
+    rows = []
 
-    mat_channels = pd.DataFrame(
-        {
-            "channel_index": range(len(channel_labels)),
-            "mat_channel": channel_labels,
-        }
+    for channel_index, channel_label in enumerate(
+        channel_labels
+    ):
+        channel_label = str(
+            channel_label
+        ).strip()
+
+        if (
+            not channel_label
+            or channel_label.lower().startswith(
+                "ch_"
+            )
+        ):
+            channel_label = make_biosemi_128_label(
+                channel_index
+            )
+
+        electrode, standard_label = split_channel_name(
+            channel_label
+        )
+
+        channel = (
+            standard_label
+            if standard_label
+            else electrode
+        )
+
+        rows.append(
+            {
+                "channel_index": channel_index,
+                "mat_channel": channel_label,
+                "channel": channel,
+                "original_channel": channel_label,
+                "electrode": electrode,
+                "standard_label": standard_label,
+                "x": np.nan,
+                "y": np.nan,
+                "z": np.nan,
+                "sph_theta": np.nan,
+                "sph_phi": np.nan,
+                "sph_radius": np.nan,
+                "theta": np.nan,
+                "radius": np.nan,
+                "type": "EEG",
+                "units": np.nan,
+                "status": np.nan,
+                "status_description": np.nan,
+            }
+        )
+
+    channel_metadata = pd.DataFrame(
+        rows
     )
 
-    mat_channels["mat_channel"] = mat_channels["mat_channel"].astype(str)
+    if len(channel_metadata) != len(
+        channel_labels
+    ):
+        raise ValueError(
+            "Channel metadata count does not match "
+            "the number of MAT-file channel labels."
+        )
 
-    mat_channels["electrode"] = mat_channels.apply(
-        lambda row: (
-            make_biosemi_128_label(int(row["channel_index"]))
-            if row["mat_channel"].lower().startswith("ch_")
-            else split_channel_name(row["mat_channel"])[0]
-        ),
-        axis=1,
-    )
-
-    merged = mat_channels.merge(
-        subject_channels,
-        on="electrode",
-        how="left",
-    )
-
-    merged = merged.merge(
-        electrodes,
-        on="electrode",
-        how="left",
-    )
-
-    merged["channel"] = merged.apply(
-        lambda row: (
-            row["channel_clean"]
-            if pd.notna(row.get("channel_clean"))
-            and str(row.get("channel_clean")).strip() != ""
-            else row["mat_channel"]
-        ),
-        axis=1,
-    )
-
-    merged["original_channel"] = merged.apply(
-        lambda row: (
-            row["original_channel"]
-            if pd.notna(row.get("original_channel"))
-            else row["mat_channel"]
-        ),
-        axis=1,
-    )
-
-    return merged
+    return channel_metadata
 
 def normalise_stim_file(series: pd.Series) -> pd.Series:
     """
@@ -1448,8 +1454,8 @@ def main():
 
     parser = argparse.ArgumentParser(
         description=(
-            "Export ERP .mat files to long-format EEG TSV "
-            "with stimulus identifiers and channel coordinates."
+            "Export CP ERP MAT files to long-format EEG TSV "
+            "with retained-trial stimulus identifiers."
         )
     )
 
@@ -1457,7 +1463,20 @@ def main():
         "erp_root",
         help=(
             "Path to the ERP derivatives folder containing "
-            "sub-*/*_erp-CP.mat files."
+            "sub-*/*_erp-CP.mat and matching "
+            "*_erp-CP_trialrej.tsv files."
+        ),
+    )
+
+    parser.add_argument(
+        "--bids-root",
+        required=True,
+        help=(
+            "Path to the original N400 BIDS dataset root. "
+            "This directory must contain "
+            "N400Stimset_stimuli_parameters.tsv and subject "
+            "sub-XX/eeg/sub-XX_task-N400Stimset_events.tsv files. "
+            "Do not set this to the erps directory."
         ),
     )
 
@@ -1465,19 +1484,8 @@ def main():
         "--output-dir",
         default="eeg_outputs",
         help=(
-            "Folder where participant and combined EEG TSV "
+            "Directory where participant and combined EEG TSV "
             "files will be saved."
-        ),
-    )
-
-    parser.add_argument(
-        "--bids-root",
-        default=".",
-        help=(
-            "Root BIDS dataset folder containing "
-            "N400Stimset_stimuli_parameters.tsv, "
-            "task-N400Stimset_electrodes.tsv, and "
-            "sub-XX/eeg/*_channels.tsv and *_events.tsv files."
         ),
     )
 
@@ -1485,19 +1493,24 @@ def main():
 
     erp_root = Path(
         args.erp_root
-    )
-
-    output_dir = Path(
-        args.output_dir
-    )
+    ).expanduser().resolve()
 
     bids_root = Path(
         args.bids_root
-    )
+    ).expanduser().resolve()
+
+    output_dir = Path(
+        args.output_dir
+    ).expanduser().resolve()
 
     if not erp_root.exists():
         raise FileNotFoundError(
             f"ERP root not found: {erp_root}"
+        )
+
+    if not erp_root.is_dir():
+        raise NotADirectoryError(
+            f"ERP root is not a directory: {erp_root}"
         )
 
     if not bids_root.exists():
@@ -1505,14 +1518,9 @@ def main():
             f"BIDS root not found: {bids_root}"
         )
 
-    electrodes_path = (
-        bids_root
-        / "task-N400Stimset_electrodes.tsv"
-    )
-
-    if not electrodes_path.exists():
-        raise FileNotFoundError(
-            f"Electrodes file not found: {electrodes_path}"
+    if not bids_root.is_dir():
+        raise NotADirectoryError(
+            f"BIDS root is not a directory: {bids_root}"
         )
 
     stimulus_parameters_path = (
@@ -1522,8 +1530,10 @@ def main():
 
     if not stimulus_parameters_path.exists():
         raise FileNotFoundError(
-            "Stimulus parameters file not found: "
-            f"{stimulus_parameters_path}"
+            "The original stimulus table was not found.\n"
+            f"Expected: {stimulus_parameters_path}\n"
+            "The --bids-root argument must point to the original "
+            "N400 dataset root, not to its erps directory."
         )
 
     mat_files = sorted(
@@ -1534,8 +1544,71 @@ def main():
 
     if not mat_files:
         raise FileNotFoundError(
-            "No *_erp-CP.mat files found under "
-            f"{erp_root}"
+            "No CP ERP MAT files were found.\n"
+            f"Searched: {erp_root}/sub-*/*_erp-CP.mat"
+        )
+
+    missing_rejection_files = []
+
+    for mat_path in mat_files:
+        rejection_path = mat_path.with_name(
+            mat_path.stem
+            + "_trialrej.tsv"
+        )
+
+        if not rejection_path.exists():
+            missing_rejection_files.append(
+                rejection_path
+            )
+
+    if missing_rejection_files:
+        examples = "\n".join(
+            str(path)
+            for path in missing_rejection_files[:10]
+        )
+
+        raise FileNotFoundError(
+            "Some ERP MAT files do not have matching "
+            "_trialrej.tsv files.\n"
+            f"{examples}"
+        )
+
+    subjects = sorted(
+        {
+            get_subject_id(
+                mat_path
+            )
+            for mat_path in mat_files
+        }
+    )
+
+    missing_events_files = []
+
+    for subject in subjects:
+        events_path = (
+            bids_root
+            / subject
+            / "eeg"
+            / f"{subject}_task-N400Stimset_events.tsv"
+        )
+
+        if not events_path.exists():
+            missing_events_files.append(
+                events_path
+            )
+
+    if missing_events_files:
+        examples = "\n".join(
+            str(path)
+            for path in missing_events_files[:10]
+        )
+
+        raise FileNotFoundError(
+            "Subject events files required for matching retained "
+            "ERP trials to stimuli were not found.\n"
+            f"{examples}\n"
+            "The --bids-root argument must point to the original "
+            "N400 BIDS dataset root."
         )
 
     print(
@@ -1543,11 +1616,11 @@ def main():
     )
 
     print(
-        f"Using BIDS root: {bids_root}"
+        f"Using ERP root: {erp_root}"
     )
 
     print(
-        f"Using electrodes file: {electrodes_path}"
+        f"Using original BIDS root: {bids_root}"
     )
 
     print(
@@ -1555,8 +1628,12 @@ def main():
         f"{stimulus_parameters_path}"
     )
 
-    output_files = []
+    output_dir.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
 
+    output_files = []
     failed_files = []
 
     for mat_path in mat_files:
@@ -1568,10 +1645,9 @@ def main():
                 bids_root=bids_root,
             )
 
-            if out_path is not None:
-                output_files.append(
-                    out_path
-                )
+            output_files.append(
+                out_path
+            )
 
         except Exception as error:
             print(
@@ -1584,6 +1660,24 @@ def main():
                     "error": str(error),
                 }
             )
+
+    if failed_files:
+        failed_path = (
+            output_dir
+            / "failed_erp_exports.tsv"
+        )
+
+        pd.DataFrame(
+            failed_files
+        ).to_csv(
+            failed_path,
+            sep="\t",
+            index=False,
+        )
+
+        print(
+            f"Saved failed-export report: {failed_path}"
+        )
 
     if not output_files:
         raise RuntimeError(
@@ -1634,36 +1728,14 @@ def main():
         f"{combined_path}"
     )
 
-    if failed_files:
-        output_dir.mkdir(
-            parents=True,
-            exist_ok=True,
-        )
-
-        failed_path = (
-            output_dir
-            / "failed_erp_exports.tsv"
-        )
-
-        pd.DataFrame(
-            failed_files
-        ).to_csv(
-            failed_path,
-            sep="\t",
-            index=False,
-        )
-
-        print(
-            f"Saved failed-export report: {failed_path}"
-        )
-
-        print(
-            f"{len(failed_files)} ERP files failed."
-        )
-
     print(
         f"{len(output_files)} ERP files exported successfully."
     )
+
+    if failed_files:
+        print(
+            f"{len(failed_files)} ERP files failed."
+        )
 
     print("\nDone.")
 
