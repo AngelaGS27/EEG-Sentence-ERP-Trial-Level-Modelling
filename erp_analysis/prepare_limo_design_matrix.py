@@ -65,18 +65,38 @@ def normalise_stim_file(
     )
 
 def load_stimulus_lookup(
-    stimulus_parameters_path: Path,
+    language_metrics_path: Path,
 ) -> pd.DataFrame:
     """
-    Load the dataset stimulus table and create a validated
+    Load the complete language metrics table and create a validated
     stim_file -> stim_key lookup.
 
-    Expected file:
-        N400Stimset_stimuli_parameters.tsv
+    Expected input:
+        language_outputs/ALL_language_metrics.tsv
+
+    This function is retained for workflows that start directly from
+    events.tsv. The main retained-trial workflow normally receives
+    stim_file and stim_key from export_erp_long.py.
     """
 
+    language_metrics_path = Path(
+        language_metrics_path
+    ).expanduser().resolve()
+
+    if not language_metrics_path.exists():
+        raise FileNotFoundError(
+            "Language metrics file not found: "
+            f"{language_metrics_path}"
+        )
+
+    if not language_metrics_path.is_file():
+        raise FileNotFoundError(
+            "Language metrics path is not a file: "
+            f"{language_metrics_path}"
+        )
+
     stimuli = pd.read_csv(
-        stimulus_parameters_path,
+        language_metrics_path,
         sep="\t",
     )
 
@@ -93,8 +113,10 @@ def load_stimulus_lookup(
 
     if missing_columns:
         raise ValueError(
-            "Stimulus parameters table is missing "
-            f"required columns: {missing_columns}"
+            "Language metrics table is missing required "
+            f"columns: {missing_columns}. "
+            "Use ALL_language_metrics.tsv, not "
+            "ALL_language_metrics_GLM.tsv, for this lookup."
         )
 
     stimuli = stimuli.copy()
@@ -107,24 +129,39 @@ def load_stimulus_lookup(
         stimuli["stim_key"]
     )
 
-    if stimuli["stim_file"].isna().any():
+    missing_stim_files = (
+        stimuli["stim_file"].isna()
+        | stimuli["stim_file"].eq("")
+    )
+
+    if missing_stim_files.any():
         raise ValueError(
-            "Stimulus parameters table contains "
-            "missing stim_file values."
+            "Language metrics table contains "
+            f"{int(missing_stim_files.sum())} missing or empty "
+            "stim_file values."
         )
 
-    if stimuli["stim_key"].isna().any():
+    missing_stim_keys = (
+        stimuli["stim_key"].isna()
+        | stimuli["stim_key"].eq("")
+    )
+
+    if missing_stim_keys.any():
         raise ValueError(
-            "Stimulus parameters table contains "
-            "missing stim_key values."
+            "Language metrics table contains "
+            f"{int(missing_stim_keys.sum())} missing or empty "
+            "stim_key values."
         )
 
     conflicting = (
         stimuli
         .groupby(
-            "stim_file"
+            "stim_file",
+            dropna=False,
         )["stim_key"]
-        .nunique()
+        .nunique(
+            dropna=False
+        )
     )
 
     conflicting = conflicting[
@@ -133,9 +170,8 @@ def load_stimulus_lookup(
 
     if not conflicting.empty:
         raise ValueError(
-            "Some stim_file values map to more "
-            "than one stim_key. Examples: "
-            f"{conflicting.index[:10].tolist()}"
+            "Some stim_file values map to more than one stim_key. "
+            f"Examples: {conflicting.index[:10].tolist()}"
         )
 
     lookup = (
@@ -156,7 +192,7 @@ def load_stimulus_lookup(
 
     print(
         f"Loaded {len(lookup)} stimulus mappings "
-        f"from {stimulus_parameters_path}"
+        f"from {language_metrics_path}"
     )
 
     return lookup
@@ -215,9 +251,24 @@ def load_trial_lookup(
     """
     Load the retained-trial lookup created by export_erp_long.py.
 
-    The table contains only trials that survived EEG rejection,
-    along with their matched stimulus identifiers.
+    The table contains one row for every ERP trial that survived
+    rejection, with the stimulus identifier attached by the ERP
+    export stage.
+
+    Output order is:
+        condition
+        retained_trial
     """
+
+    trial_lookup_path = Path(
+        trial_lookup_path
+    ).expanduser().resolve()
+
+    if not trial_lookup_path.exists():
+        raise FileNotFoundError(
+            "Trial lookup file not found: "
+            f"{trial_lookup_path}"
+        )
 
     lookup = pd.read_csv(
         trial_lookup_path,
@@ -248,6 +299,11 @@ def load_trial_lookup(
             f"columns: {missing_columns}"
         )
 
+    if lookup.empty:
+        raise ValueError(
+            f"Trial lookup is empty: {trial_lookup_path}"
+        )
+
     lookup = lookup.copy()
 
     lookup["stim_key"] = normalise_stim_key(
@@ -258,12 +314,44 @@ def load_trial_lookup(
         lookup["stim_file"]
     )
 
-    if lookup["stim_key"].isna().any():
+    integer_columns = [
+        "condition",
+        "retained_trial",
+        "urevent_index",
+        "original_event_row",
+    ]
+
+    for column in integer_columns:
+        lookup[column] = pd.to_numeric(
+            lookup[column],
+            errors="raise",
+        ).astype(int)
+
+    missing_stim_keys = (
+        lookup["stim_key"].isna()
+        | lookup["stim_key"].eq("")
+    )
+
+    if missing_stim_keys.any():
         raise ValueError(
-            "Trial lookup contains missing stim_key values."
+            "Trial lookup contains "
+            f"{int(missing_stim_keys.sum())} missing or empty "
+            "stim_key values."
         )
 
-    duplicated = lookup.duplicated(
+    missing_stim_files = (
+        lookup["stim_file"].isna()
+        | lookup["stim_file"].eq("")
+    )
+
+    if missing_stim_files.any():
+        raise ValueError(
+            "Trial lookup contains "
+            f"{int(missing_stim_files.sum())} missing or empty "
+            "stim_file values."
+        )
+
+    duplicated_retained_trials = lookup.duplicated(
         subset=[
             "condition",
             "retained_trial",
@@ -271,16 +359,77 @@ def load_trial_lookup(
         keep=False,
     )
 
-    if duplicated.any():
+    if duplicated_retained_trials.any():
+        examples = (
+            lookup.loc[
+                duplicated_retained_trials,
+                [
+                    "condition",
+                    "retained_trial",
+                ],
+            ]
+            .head(10)
+            .to_dict(
+                "records"
+            )
+        )
+
         raise ValueError(
-            "Trial lookup contains duplicate retained trials."
+            "Trial lookup contains duplicate "
+            "condition/retained_trial combinations. "
+            f"Examples: {examples}"
+        )
+
+    duplicated_events = lookup.duplicated(
+        subset=[
+            "original_event_row",
+        ],
+        keep=False,
+    )
+
+    if duplicated_events.any():
+        examples = (
+            lookup.loc[
+                duplicated_events,
+                [
+                    "condition",
+                    "retained_trial",
+                    "original_event_row",
+                    "stim_key",
+                ],
+            ]
+            .head(10)
+            .to_dict(
+                "records"
+            )
+        )
+
+        raise ValueError(
+            "The same original event is assigned to more than "
+            "one retained ERP trial. "
+            f"Examples: {examples}"
+        )
+
+    subject_values = (
+        lookup["subject"]
+        .astype("string")
+        .str.strip()
+        .dropna()
+        .unique()
+    )
+
+    if len(subject_values) != 1:
+        raise ValueError(
+            "A subject-specific trial lookup must contain exactly "
+            f"one subject, but found: {subject_values.tolist()}"
         )
 
     lookup = lookup.sort_values(
         [
             "condition",
             "retained_trial",
-        ]
+        ],
+        kind="stable",
     ).reset_index(
         drop=True
     )
@@ -318,9 +467,23 @@ def load_subject_events(
     """
     Load one subject's events.tsv.
 
-    Only NPC and NPI sentence trials are retained.
-    stim_key is attached through stim_file.
+    Only NPC and NPI sentence trials are retained. stim_key is
+    attached by matching stim_file to the lookup constructed from
+    language_outputs/ALL_language_metrics.tsv.
+
+    This function is retained for workflows that operate directly
+    from events.tsv. The current main workflow uses the retained-trial
+    lookup created by export_erp_long.py.
     """
+
+    events_path = Path(
+        events_path
+    ).expanduser().resolve()
+
+    if not events_path.exists():
+        raise FileNotFoundError(
+            f"Events file not found: {events_path}"
+        )
 
     events = pd.read_csv(
         events_path,
@@ -351,6 +514,12 @@ def load_subject_events(
 
     events = events.copy()
 
+    # Preserve the row in the complete events table before filtering.
+    events["original_event_row"] = range(
+        1,
+        len(events) + 1,
+    )
+
     events["trial_type"] = (
         events["trial_type"]
         .astype("string")
@@ -376,6 +545,17 @@ def load_subject_events(
         events["stim_file"]
     )
 
+    missing_stim_files = (
+        events["stim_file"].isna()
+        | events["stim_file"].eq("")
+    )
+
+    if missing_stim_files.any():
+        raise ValueError(
+            f"{int(missing_stim_files.sum())} NPC/NPI events "
+            "contain missing or empty stim_file values."
+        )
+
     events = events.merge(
         stimulus_lookup,
         on="stim_file",
@@ -386,8 +566,7 @@ def load_subject_events(
     )
 
     unmatched = (
-        events["_merge"]
-        != "both"
+        events["_merge"] != "both"
     )
 
     if unmatched.any():
@@ -402,18 +581,13 @@ def load_subject_events(
         )
 
         raise ValueError(
-            f"{unmatched.sum()} events could not be "
-            "matched to the stimulus parameters table. "
+            f"{int(unmatched.sum())} events could not be matched "
+            "to ALL_language_metrics.tsv using stim_file. "
             f"Examples: {examples}"
         )
 
     events = events.drop(
         columns="_merge"
-    )
-
-    events["original_event_row"] = range(
-        1,
-        len(events) + 1,
     )
 
     events["subject_trial"] = range(
@@ -428,7 +602,9 @@ def load_subject_events(
 
     events["condition"] = (
         events["trial_type"]
-        .map(condition_map)
+        .map(
+            condition_map
+        )
         .astype(int)
     )
 
@@ -444,8 +620,8 @@ def load_subject_events(
 
     print(
         f"Loaded {len(events)} experimental trials: "
-        f"{(events['trial_type'] == 'NPC').sum()} NPC and "
-        f"{(events['trial_type'] == 'NPI').sum()} NPI"
+        f"{int((events['trial_type'] == 'NPC').sum())} NPC and "
+        f"{int((events['trial_type'] == 'NPI').sum())} NPI"
     )
 
     return events.reset_index(

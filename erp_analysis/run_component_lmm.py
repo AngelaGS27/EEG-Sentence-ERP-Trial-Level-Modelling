@@ -267,60 +267,239 @@ def select_coordinate_roi(df: pd.DataFrame, roi_name: str) -> pd.Series:
     raise ValueError(f"Unknown coordinate ROI: {roi_name}")
 
 
-def select_component_rows(chunk: pd.DataFrame, component: str) -> pd.DataFrame:
+def select_component_rows(
+    chunk: pd.DataFrame,
+    component: str,
+) -> pd.DataFrame:
     """
-    Select rows belonging to a component using:
-    1. time window
-    2. named ROI labels
-    3. coordinate-based fallback
+    Select rows belonging to an ERP component using:
+
+    1. The component time window.
+    2. Standard channel labels, when available.
+    3. Electrode coordinates, when available.
+
+    The function raises a clear error when the file contains only
+    acquisition labels such as A1-A32/B1-B32 without standard labels
+    or coordinates, because an anatomical ROI cannot then be selected
+    safely.
     """
 
-    spec = COMPONENT_WINDOWS[component]
+    if component not in COMPONENT_WINDOWS:
+        raise ValueError(
+            f"Unknown ERP component: {component}"
+        )
 
-    time_mask = (
-        (chunk["time"] >= spec["time_min"])
-        & (chunk["time"] <= spec["time_max"])
+    required_columns = [
+        "time",
+        "channel",
+    ]
+
+    missing_columns = [
+        column
+        for column in required_columns
+        if column not in chunk.columns
+    ]
+
+    if missing_columns:
+        raise ValueError(
+            "ERP chunk is missing columns required for component "
+            f"selection: {missing_columns}"
+        )
+
+    spec = COMPONENT_WINDOWS[
+        component
+    ]
+
+    time_values = pd.to_numeric(
+        chunk["time"],
+        errors="coerce",
     )
 
-    time_chunk = chunk.loc[time_mask].copy()
+    time_mask = (
+        time_values.ge(
+            spec["time_min"]
+        )
+        & time_values.le(
+            spec["time_max"]
+        )
+    )
+
+    time_chunk = chunk.loc[
+        time_mask
+    ].copy()
 
     if time_chunk.empty:
         return time_chunk
 
-    time_chunk["channel_clean"] = time_chunk["channel"].map(clean_channel_label)
+    label_source = (
+        "standard_label"
+        if "standard_label" in time_chunk.columns
+        else "channel"
+    )
 
-    name_mask = time_chunk["channel_clean"].isin(spec["roi"])
+    time_chunk["channel_clean"] = (
+        time_chunk[label_source]
+        .fillna("")
+        .map(
+            clean_channel_label
+        )
+        .astype("string")
+        .str.strip()
+    )
 
-    named = time_chunk.loc[name_mask].copy()
+    # When standard_label exists but is empty, try channel.
+    empty_standard = (
+        time_chunk["channel_clean"].isna()
+        | time_chunk["channel_clean"].eq("")
+    )
 
-    # If at least two named ROI channels exist, use them.
-    if named["channel_clean"].nunique(dropna=True) >= 2:
+    if (
+        label_source == "standard_label"
+        and empty_standard.any()
+    ):
+        time_chunk.loc[
+            empty_standard,
+            "channel_clean",
+        ] = (
+            time_chunk.loc[
+                empty_standard,
+                "channel",
+            ]
+            .map(
+                clean_channel_label
+            )
+            .astype("string")
+            .str.strip()
+        )
+
+    name_mask = time_chunk[
+        "channel_clean"
+    ].isin(
+        spec["roi"]
+    )
+
+    named = time_chunk.loc[
+        name_mask
+    ].copy()
+
+    named_channel_count = named[
+        "channel_clean"
+    ].nunique(
+        dropna=True
+    )
+
+    if named_channel_count >= 2:
         log.info(
             "%s: using named ROI channels: %s",
             component,
-            sorted(named["channel_clean"].dropna().unique()),
+            sorted(
+                named[
+                    "channel_clean"
+                ]
+                .dropna()
+                .unique()
+                .tolist()
+            ),
         )
+
         return named
 
-    # Otherwise use coordinates if available.
-    if has_coordinate_columns(time_chunk):
-        coord_mask = select_coordinate_roi(
-            time_chunk,
-            spec["coordinate_roi"],
+    coordinate_columns_available = (
+        has_coordinate_columns(
+            time_chunk
+        )
+    )
+
+    if coordinate_columns_available:
+        coordinate_values = (
+            time_chunk[
+                [
+                    "x",
+                    "y",
+                    "z",
+                ]
+            ]
+            .apply(
+                pd.to_numeric,
+                errors="coerce",
+            )
         )
 
-        coord_selected = time_chunk.loc[coord_mask].copy()
-
-        if not coord_selected.empty:
-            log.info(
-                "%s: using coordinate ROI fallback: %d channels",
-                component,
-                coord_selected["channel"].nunique(dropna=True),
+        has_valid_coordinates = (
+            coordinate_values
+            .notna()
+            .all(
+                axis=1
             )
-            return coord_selected
+            .any()
+        )
 
-    # If coordinates are absent, return whatever named channels were found.
-    return named
+        if has_valid_coordinates:
+            coord_mask = select_coordinate_roi(
+                time_chunk,
+                spec[
+                    "coordinate_roi"
+                ],
+            )
+
+            coord_selected = time_chunk.loc[
+                coord_mask
+            ].copy()
+
+            if not coord_selected.empty:
+                log.info(
+                    "%s: using coordinate ROI fallback: %d channels",
+                    component,
+                    coord_selected[
+                        "channel"
+                    ].nunique(
+                        dropna=True
+                    ),
+                )
+
+                return coord_selected
+
+    available_labels = sorted(
+        time_chunk[
+            "channel_clean"
+        ]
+        .dropna()
+        .astype(str)
+        .loc[
+            lambda values: values.ne("")
+        ]
+        .unique()
+        .tolist()
+    )
+
+    acquisition_only = (
+        len(available_labels) > 0
+        and all(
+            re.fullmatch(
+                r"[ABCD]\d{1,2}",
+                label,
+                flags=re.IGNORECASE,
+            )
+            is not None
+            for label in available_labels
+        )
+    )
+
+    if acquisition_only:
+        raise ValueError(
+            f"{component} ROI cannot be selected safely. "
+            "The ERP file contains only BioSemi acquisition labels "
+            "such as A1-D32, while x/y/z coordinates and standard "
+            "10-20/10-5 labels are unavailable. The ERP exporter must "
+            "provide standard_label values or real channel coordinates."
+        )
+
+    raise ValueError(
+        f"{component} ROI could not be selected. "
+        f"Required named channels include {spec['roi']}, but only "
+        f"{available_labels[:20]} were found and no usable coordinate "
+        "fallback was available."
+    )
 
 
 def load_predictors(
@@ -392,14 +571,18 @@ def component_average_chunked(
     chunksize: int = 1_000_000,
 ) -> pd.DataFrame:
     """
-    Compute component mean amplitude from retained ERP trials.
+    Compute a component mean amplitude for every retained ERP trial.
 
-    Supports both comma-separated CSV files and tab-separated TSV files.
+    Supports comma-separated CSV and tab-separated TSV files.
 
-    Each retained subject/condition/trial remains a separate observation.
+    Chunk-level sums and counts are combined after all chunks have
+    been read, so a trial remains correct even when its rows cross a
+    chunk boundary.
     """
 
-    outcome = f"{component}_amplitude"
+    outcome = (
+        f"{component}_amplitude"
+    )
 
     required_columns = [
         "subject",
@@ -411,7 +594,13 @@ def component_average_chunked(
         "amplitude",
     ]
 
-    suffix = erp_long_path.suffix.lower()
+    erp_long_path = Path(
+        erp_long_path
+    ).expanduser().resolve()
+
+    suffix = (
+        erp_long_path.suffix.lower()
+    )
 
     if suffix == ".tsv":
         separator = "\t"
@@ -433,9 +622,11 @@ def component_average_chunked(
 
     log.info(
         "Using delimiter: %s",
-        "TAB"
-        if separator == "\t"
-        else "COMMA",
+        (
+            "TAB"
+            if separator == "\t"
+            else "COMMA"
+        ),
     )
 
     for chunk_number, chunk in enumerate(
@@ -458,15 +649,24 @@ def component_average_chunked(
                 f"columns: {missing_columns}"
             )
 
+        chunk = chunk.copy()
+
         chunk["stim_key"] = (
             chunk["stim_key"]
             .astype("string")
             .str.strip()
         )
 
-        if chunk["stim_key"].isna().any():
+        missing_stim_keys = (
+            chunk["stim_key"].isna()
+            | chunk["stim_key"].eq("")
+        )
+
+        if missing_stim_keys.any():
             raise ValueError(
-                "ERP long file contains missing stim_key values."
+                "ERP long file contains "
+                f"{int(missing_stim_keys.sum())} missing or empty "
+                f"stim_key values in chunk {chunk_number}."
             )
 
         chunk["channel"] = (
@@ -487,27 +687,25 @@ def component_average_chunked(
         )
 
         invalid_time_rows = (
-            chunk["time"]
-            .isna()
+            chunk["time"].isna()
         )
 
         if invalid_time_rows.any():
             raise ValueError(
                 "ERP long file contains "
-                f"{invalid_time_rows.sum()} invalid time values "
+                f"{int(invalid_time_rows.sum())} invalid time values "
                 f"in chunk {chunk_number}."
             )
 
         invalid_amplitude_rows = (
-            chunk["amplitude"]
-            .isna()
+            chunk["amplitude"].isna()
         )
 
         if invalid_amplitude_rows.any():
             raise ValueError(
                 "ERP long file contains "
-                f"{invalid_amplitude_rows.sum()} invalid amplitude values "
-                f"in chunk {chunk_number}."
+                f"{int(invalid_amplitude_rows.sum())} invalid "
+                f"amplitude values in chunk {chunk_number}."
             )
 
         selected = select_component_rows(
@@ -529,6 +727,7 @@ def component_average_chunked(
             "condition_label",
             "trial_type",
             "stim_file",
+            "item",
             "original_event_row",
             "experimental_trial",
             "urevent_index",
@@ -548,6 +747,7 @@ def component_average_chunked(
                 group_columns,
                 as_index=False,
                 dropna=False,
+                sort=False,
             )
             .agg(
                 amplitude_sum=(
@@ -573,8 +773,8 @@ def component_average_chunked(
 
     if not partials:
         raise ValueError(
-            f"No ERP rows found for component {component}. "
-            "Check the time units, channel labels and coordinates."
+            f"No ERP rows were selected for component {component}. "
+            "Check the time units and channel metadata."
         )
 
     all_partial = pd.concat(
@@ -598,6 +798,7 @@ def component_average_chunked(
             final_group_columns,
             as_index=False,
             dropna=False,
+            sort=False,
         )
         .agg(
             amplitude_sum=(
@@ -632,6 +833,13 @@ def component_average_chunked(
             "amplitude_n",
         ]
     )
+
+    # The ERP exporter uses stim_key as item. Preserve an explicit
+    # item column even if an older ERP file did not contain one.
+    if "item" not in final.columns:
+        final["item"] = final[
+            "stim_key"
+        ]
 
     log.info(
         "Computed %s averages: %d retained trials",
@@ -948,61 +1156,239 @@ def formula_required_columns(formula: str, df: pd.DataFrame) -> list[str]:
 
     return sorted(set(columns))
 
-def fit_mixed_model(df: pd.DataFrame, formula: str, outcome: str):
+def fit_mixed_model(
+    df: pd.DataFrame,
+    formula: str,
+    outcome: str,
+):
     """
-    Fit mixed model.
+    Fit a mixed linear model.
 
-    Random structure:
-        groups = subject
-        item variance component if item is available
+    Random-effects structure:
+
+        subject random intercept
+
+    plus an item variance component using:
+
+        item
+
+    or, when item is not explicitly present:
+
+        stim_key
     """
 
-    required = [outcome, "subject"]
+    required_columns = [
+        outcome,
+        "subject",
+    ]
 
-    for col in required:
-        if col not in df.columns:
-            raise ValueError(f"Missing required model column: {col}")
+    missing_required = [
+        column
+        for column in required_columns
+        if column not in df.columns
+    ]
+
+    if missing_required:
+        raise ValueError(
+            "Missing required model columns: "
+            + ", ".join(
+                missing_required
+            )
+        )
 
     model_df = df.copy()
 
-    formula_cols = formula_required_columns(formula, model_df)
+    model_df["subject"] = (
+        model_df["subject"]
+        .astype("string")
+        .str.strip()
+    )
 
-    drop_cols = sorted(set([outcome, "subject"] + formula_cols))
+    if "item" in model_df.columns:
+        model_df["item"] = (
+            model_df["item"]
+            .astype("string")
+            .str.strip()
+        )
+        item_column = "item"
 
-    log.info("Dropping rows with missing values in model columns: %s", drop_cols)
+    elif "stim_key" in model_df.columns:
+        model_df["stim_key"] = (
+            model_df["stim_key"]
+            .astype("string")
+            .str.strip()
+        )
+        item_column = "stim_key"
 
-    model_df = model_df.dropna(subset=drop_cols)
+    else:
+        item_column = None
+
+    formula_columns = formula_required_columns(
+        formula,
+        model_df,
+    )
+
+    drop_columns = sorted(
+        set(
+            [
+                outcome,
+                "subject",
+            ]
+            + formula_columns
+            + (
+                [item_column]
+                if item_column is not None
+                else []
+            )
+        )
+    )
+
+    log.info(
+        "Dropping rows with missing values in model columns: %s",
+        drop_columns,
+    )
+
+    model_df = model_df.dropna(
+        subset=drop_columns
+    ).copy()
 
     if len(model_df) < 10:
         raise ValueError(
-            "Too few rows for model after dropping missing outcome, subject, "
-            "or predictor values."
+            "Too few rows for the model after removing rows with "
+            "missing outcome, subject, item, or predictor values. "
+            f"Rows remaining: {len(model_df)}"
         )
 
-    vc = {}
+    n_subjects = model_df[
+        "subject"
+    ].nunique(
+        dropna=True
+    )
 
-    if "item" in model_df.columns:
-        vc["item"] = "0 + C(item)"
+    if n_subjects < 2:
+        raise ValueError(
+            "A mixed model requires at least two subjects. "
+            f"Found: {n_subjects}"
+        )
 
-    log.info("Rows used in final model: %d", len(model_df))
-    log.info("Fitting formula:")
-    log.info(formula)
+    variance_components = {}
+
+    if item_column is not None:
+        n_items = model_df[
+            item_column
+        ].nunique(
+            dropna=True
+        )
+
+        if n_items >= 2:
+            variance_components[
+                "item"
+            ] = (
+                f"0 + C({item_column})"
+            )
+
+            log.info(
+                "Using crossed item variance component based on %s "
+                "(%d unique items).",
+                item_column,
+                n_items,
+            )
+
+    log.info(
+        "Rows used in final model: %d",
+        len(model_df),
+    )
+
+    log.info(
+        "Subjects used in final model: %d",
+        n_subjects,
+    )
+
+    log.info(
+        "Fitting formula: %s",
+        formula,
+    )
 
     model = smf.mixedlm(
         formula=formula,
         data=model_df,
-        groups=model_df["subject"],
-        vc_formula=vc if vc else None,
+        groups=model_df[
+            "subject"
+        ],
+        vc_formula=(
+            variance_components
+            if variance_components
+            else None
+        ),
+        re_formula="1",
     )
 
-    try:
-        result = model.fit(reml=False, method="lbfgs", maxiter=500)
-    except Exception as first_error:
-        log.warning("LBFGS failed: %s", first_error)
-        log.warning("Trying Powell optimizer.")
-        result = model.fit(reml=False, method="powell", maxiter=500)
+    fit_attempts = [
+        (
+            "lbfgs",
+            {
+                "reml": False,
+                "method": "lbfgs",
+                "maxiter": 1000,
+            },
+        ),
+        (
+            "powell",
+            {
+                "reml": False,
+                "method": "powell",
+                "maxiter": 1000,
+            },
+        ),
+        (
+            "cg",
+            {
+                "reml": False,
+                "method": "cg",
+                "maxiter": 1000,
+            },
+        ),
+    ]
 
-    return result, model_df
+    errors = []
+
+    for optimiser_name, fit_arguments in fit_attempts:
+        try:
+            log.info(
+                "Trying optimiser: %s",
+                optimiser_name,
+            )
+
+            result = model.fit(
+                **fit_arguments
+            )
+
+            if not result.converged:
+                log.warning(
+                    "%s returned a result but did not report "
+                    "convergence.",
+                    optimiser_name,
+                )
+
+            return result, model_df
+
+        except Exception as error:
+            errors.append(
+                f"{optimiser_name}: {error}"
+            )
+
+            log.warning(
+                "%s optimiser failed: %s",
+                optimiser_name,
+                error,
+            )
+
+    raise RuntimeError(
+        "All mixed-model optimisers failed.\n"
+        + "\n".join(
+            errors
+        )
+    )
 
 def run_deepchecks_before_model(
     df: pd.DataFrame,

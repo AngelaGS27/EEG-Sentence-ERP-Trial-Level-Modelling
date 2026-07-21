@@ -505,46 +505,57 @@ def normalise_stim_file(series: pd.Series) -> pd.Series:
 
 
 def load_stimulus_lookup(
-    bids_root: Path,
+    language_metrics_path: Path,
 ) -> pd.DataFrame:
     """
-    Load the dataset stimulus table and construct a unique
+    Load the complete language-output table and construct a unique
     stim_file -> stim_key lookup.
 
-    Expected dataset file:
-        N400Stimset_stimuli_parameters.tsv
-    """
-    stimulus_path = (
-        bids_root
-        / "N400Stimset_stimuli_parameters.tsv"
-    )
+    Expected language-output file:
+        language_outputs/ALL_language_metrics.tsv
 
-    if not stimulus_path.exists():
+    The full language metrics table is used because it contains both
+    stim_file and stim_key.
+    """
+
+    language_metrics_path = Path(
+        language_metrics_path
+    ).expanduser().resolve()
+
+    if not language_metrics_path.exists():
         raise FileNotFoundError(
-            "Stimulus parameters file not found: "
-            f"{stimulus_path}"
+            "Language metrics file not found: "
+            f"{language_metrics_path}"
+        )
+
+    if not language_metrics_path.is_file():
+        raise FileNotFoundError(
+            "Language metrics path is not a file: "
+            f"{language_metrics_path}"
         )
 
     stimuli = pd.read_csv(
-        stimulus_path,
+        language_metrics_path,
         sep="\t",
     )
 
-    required = [
+    required_columns = [
         "stim_file",
         "stim_key",
     ]
 
-    missing = [
-        col
-        for col in required
-        if col not in stimuli.columns
+    missing_columns = [
+        column
+        for column in required_columns
+        if column not in stimuli.columns
     ]
 
-    if missing:
+    if missing_columns:
         raise ValueError(
-            "Stimulus parameters table is missing "
-            f"columns: {missing}"
+            "Language metrics table is missing required "
+            f"columns: {missing_columns}. "
+            "ALL_language_metrics.tsv must contain both "
+            "stim_file and stim_key."
         )
 
     stimuli = stimuli.copy()
@@ -559,30 +570,52 @@ def load_stimulus_lookup(
         .str.strip()
     )
 
-    if stimuli["stim_file"].isna().any():
-        raise ValueError(
-            "Stimulus table contains missing stim_file values."
-        )
-
-    if stimuli["stim_key"].isna().any():
-        raise ValueError(
-            "Stimulus table contains missing stim_key values."
-        )
-
-    conflicting = (
-        stimuli
-        .groupby("stim_file")["stim_key"]
-        .nunique()
+    missing_stim_file = (
+        stimuli["stim_file"].isna()
+        | stimuli["stim_file"].eq("")
     )
 
-    conflicting = conflicting[
-        conflicting > 1
-    ]
-
-    if not conflicting.empty:
+    if missing_stim_file.any():
         raise ValueError(
-            "Some stimulus filenames map to multiple stim_key values. "
-            f"Examples: {conflicting.index[:10].tolist()}"
+            "Language metrics table contains "
+            f"{int(missing_stim_file.sum())} missing or empty "
+            "stim_file values."
+        )
+
+    missing_stim_key = (
+        stimuli["stim_key"].isna()
+        | stimuli["stim_key"].eq("")
+    )
+
+    if missing_stim_key.any():
+        raise ValueError(
+            "Language metrics table contains "
+            f"{int(missing_stim_key.sum())} missing or empty "
+            "stim_key values."
+        )
+
+    conflicting_file_mappings = (
+        stimuli
+        .groupby(
+            "stim_file",
+            dropna=False,
+        )["stim_key"]
+        .nunique(
+            dropna=False
+        )
+    )
+
+    conflicting_file_mappings = (
+        conflicting_file_mappings[
+            conflicting_file_mappings > 1
+        ]
+    )
+
+    if not conflicting_file_mappings.empty:
+        raise ValueError(
+            "Some stimulus filenames in the language metrics table "
+            "map to multiple stim_key values. Examples: "
+            f"{conflicting_file_mappings.index[:10].tolist()}"
         )
 
     lookup = (
@@ -595,12 +628,39 @@ def load_stimulus_lookup(
         .drop_duplicates(
             subset="stim_file"
         )
-        .reset_index(drop=True)
+        .reset_index(
+            drop=True
+        )
     )
+
+    duplicate_key_mappings = (
+        lookup
+        .groupby(
+            "stim_key",
+            dropna=False,
+        )["stim_file"]
+        .nunique(
+            dropna=False
+        )
+    )
+
+    duplicate_key_mappings = (
+        duplicate_key_mappings[
+            duplicate_key_mappings > 1
+        ]
+    )
+
+    if not duplicate_key_mappings.empty:
+        print(
+            "Warning: some stim_key values correspond to more than "
+            "one stimulus filename. Matching will remain based on "
+            "stim_file. Examples: "
+            f"{duplicate_key_mappings.index[:10].tolist()}"
+        )
 
     print(
         f"Loaded {len(lookup)} stimulus mappings "
-        f"from {stimulus_path}"
+        f"from {language_metrics_path}"
     )
 
     return lookup
@@ -611,22 +671,41 @@ def load_subject_events(
     stimulus_lookup: pd.DataFrame,
 ) -> pd.DataFrame:
     """
-    Load the subject's experimental sentence events.
-
-    stim_key is attached through:
-        stim_file -> N400Stimset_stimuli_parameters.tsv
+    Load one subject's events table and attach stim_key by matching
+    each event's stim_file to the mapping loaded from
+    language_outputs/ALL_language_metrics.tsv.
     """
 
-    events_path = (
-        bids_root
-        / subject
-        / "eeg"
-        / f"{subject}_task-N400Stimset_events.tsv"
+    possible_paths = [
+        (
+            bids_root
+            / subject
+            / "eeg"
+            / f"{subject}_task-N400Stimset_events.tsv"
+        ),
+        (
+            bids_root
+            / subject
+            / f"{subject}_task-N400Stimset_events.tsv"
+        ),
+    ]
+
+    events_path = next(
+        (
+            path
+            for path in possible_paths
+            if path.exists()
+        ),
+        None,
     )
 
-    if not events_path.exists():
+    if events_path is None:
         raise FileNotFoundError(
-            f"Events file not found: {events_path}"
+            "Events file not found. Checked:\n"
+            + "\n".join(
+                str(path)
+                for path in possible_paths
+            )
         )
 
     events = pd.read_csv(
@@ -654,7 +733,6 @@ def load_subject_events(
 
     events = events.copy()
 
-    # Preserve the row number in the complete BIDS events table.
     events["original_event_row"] = range(
         1,
         len(events) + 1,
@@ -667,7 +745,6 @@ def load_subject_events(
         .str.upper()
     )
 
-    # Keep only the actual experimental sentence trials.
     events = events[
         events["trial_type"].isin(
             [
@@ -682,13 +759,19 @@ def load_subject_events(
             f"No NPC or NPI sentence events found in {events_path}"
         )
 
-    # BIDS onset is the final target-word onset.
     events["target_onset_seconds"] = pd.to_numeric(
         events["onset"],
         errors="coerce",
     )
 
-    if events["target_onset_seconds"].isna().any():
+    invalid_onsets = (
+        events["target_onset_seconds"].isna()
+        | ~np.isfinite(
+            events["target_onset_seconds"]
+        )
+    )
+
+    if invalid_onsets.any():
         raise ValueError(
             "Some NPC/NPI events have missing or invalid "
             "target-word onset values."
@@ -697,6 +780,17 @@ def load_subject_events(
     events["stim_file"] = normalise_stim_file(
         events["stim_file"]
     )
+
+    missing_event_stimuli = (
+        events["stim_file"].isna()
+        | events["stim_file"].eq("")
+    )
+
+    if missing_event_stimuli.any():
+        raise ValueError(
+            "Some NPC/NPI events contain missing or empty "
+            "stim_file values."
+        )
 
     events = events.merge(
         stimulus_lookup,
@@ -707,7 +801,9 @@ def load_subject_events(
         indicator=True,
     )
 
-    unmatched = events["_merge"] != "both"
+    unmatched = (
+        events["_merge"] != "both"
+    )
 
     if unmatched.any():
         examples = (
@@ -721,14 +817,26 @@ def load_subject_events(
         )
 
         raise ValueError(
-            f"{unmatched.sum()} event rows could not be matched "
-            "to N400Stimset_stimuli_parameters.tsv. "
-            f"Examples: {examples}"
+            f"{int(unmatched.sum())} event rows in {events_path} "
+            "could not be matched to "
+            "language_outputs/ALL_language_metrics.tsv using "
+            f"stim_file. Examples: {examples}"
         )
 
     events = events.drop(
         columns="_merge"
     )
+
+    missing_matched_keys = (
+        events["stim_key"].isna()
+        | events["stim_key"].astype("string").str.strip().eq("")
+    )
+
+    if missing_matched_keys.any():
+        raise ValueError(
+            "Some matched experimental events still have missing "
+            "stim_key values."
+        )
 
     events = events.sort_values(
         "target_onset_seconds"
@@ -744,8 +852,8 @@ def load_subject_events(
     print(
         f"  Loaded {len(events)} experimental events "
         f"for {subject}: "
-        f"{(events['trial_type'] == 'NPC').sum()} NPC and "
-        f"{(events['trial_type'] == 'NPI').sum()} NPI"
+        f"{int((events['trial_type'] == 'NPC').sum())} NPC and "
+        f"{int((events['trial_type'] == 'NPI').sum())} NPI"
     )
 
     return events[
@@ -946,6 +1054,7 @@ def export_long_for_file(
     mat_path: Path,
     output_dir: Path,
     bids_root: Path,
+    stimulus_lookup: pd.DataFrame,
 ):
     """
     Export one subject's CP ERP derivative to long-format TSV.
@@ -954,10 +1063,11 @@ def export_long_for_file(
 
     1. Reads the retained trial's EEGLAB eventurevent reference.
     2. Converts the corresponding urevent latency to seconds.
-    3. Matches that latency to the final-word onset in events.tsv.
-    4. Recovers stim_file and stim_key.
-    5. Exports trial-level EEG data with channel metadata.
-    6. Saves a retained-trial lookup for design-matrix construction.
+    3. Matches that latency to the target-word onset in events.tsv.
+    4. Gets stim_file from events.tsv.
+    5. Gets stim_key from the language-output stimulus lookup.
+    6. Exports trial-level EEG data with channel metadata.
+    7. Saves a retained-trial lookup for later model construction.
     """
 
     subject = get_subject_id(
@@ -966,10 +1076,6 @@ def export_long_for_file(
 
     print(
         f"\nProcessing {mat_path.name}"
-    )
-
-    stimulus_lookup = load_stimulus_lookup(
-        bids_root
     )
 
     events = load_subject_events(
@@ -1006,7 +1112,9 @@ def export_long_for_file(
         )
 
         if (
-            not np.isfinite(sampling_frequency)
+            not np.isfinite(
+                sampling_frequency
+            )
             or sampling_frequency <= 0
         ):
             raise ValueError(
@@ -1389,9 +1497,14 @@ def export_long_for_file(
                 f"Examples: {examples}"
             )
 
-        if trial_lookup_all[
-            "stim_key"
-        ].isna().any():
+        missing_stim_keys = (
+            trial_lookup_all["stim_key"].isna()
+            | trial_lookup_all[
+                "stim_key"
+            ].astype("string").str.strip().eq("")
+        )
+
+        if missing_stim_keys.any():
             raise ValueError(
                 f"{subject} contains retained trials with "
                 "missing stim_key values."
@@ -1451,11 +1564,10 @@ def export_long_for_file(
     return out_path
 
 def main():
-
     parser = argparse.ArgumentParser(
         description=(
             "Export CP ERP MAT files to long-format EEG TSV "
-            "with retained-trial stimulus identifiers."
+            "and attach stimulus identifiers from the language outputs."
         )
     )
 
@@ -1472,11 +1584,18 @@ def main():
         "--bids-root",
         required=True,
         help=(
-            "Path to the original N400 BIDS dataset root. "
-            "This directory must contain "
-            "N400Stimset_stimuli_parameters.tsv and subject "
-            "sub-XX/eeg/sub-XX_task-N400Stimset_events.tsv files. "
-            "Do not set this to the erps directory."
+            "Path containing subject event files such as "
+            "sub-XX/eeg/sub-XX_task-N400Stimset_events.tsv. "
+            "This path is used only for the participant events tables."
+        ),
+    )
+
+    parser.add_argument(
+        "--language-metrics",
+        required=True,
+        help=(
+            "Path to language_outputs/ALL_language_metrics.tsv. "
+            "This table must contain stim_file and stim_key."
         ),
     )
 
@@ -1499,6 +1618,10 @@ def main():
         args.bids_root
     ).expanduser().resolve()
 
+    language_metrics_path = Path(
+        args.language_metrics
+    ).expanduser().resolve()
+
     output_dir = Path(
         args.output_dir
     ).expanduser().resolve()
@@ -1515,26 +1638,29 @@ def main():
 
     if not bids_root.exists():
         raise FileNotFoundError(
-            f"BIDS root not found: {bids_root}"
+            f"Events root not found: {bids_root}"
         )
 
     if not bids_root.is_dir():
         raise NotADirectoryError(
-            f"BIDS root is not a directory: {bids_root}"
+            f"Events root is not a directory: {bids_root}"
         )
 
-    stimulus_parameters_path = (
-        bids_root
-        / "N400Stimset_stimuli_parameters.tsv"
-    )
-
-    if not stimulus_parameters_path.exists():
+    if not language_metrics_path.exists():
         raise FileNotFoundError(
-            "The original stimulus table was not found.\n"
-            f"Expected: {stimulus_parameters_path}\n"
-            "The --bids-root argument must point to the original "
-            "N400 dataset root, not to its erps directory."
+            "Language metrics file not found:\n"
+            f"{language_metrics_path}"
         )
+
+    if not language_metrics_path.is_file():
+        raise FileNotFoundError(
+            "Language metrics path is not a file:\n"
+            f"{language_metrics_path}"
+        )
+
+    stimulus_lookup = load_stimulus_lookup(
+        language_metrics_path
+    )
 
     mat_files = sorted(
         erp_root.glob(
@@ -1585,30 +1711,42 @@ def main():
     missing_events_files = []
 
     for subject in subjects:
-        events_path = (
-            bids_root
-            / subject
-            / "eeg"
-            / f"{subject}_task-N400Stimset_events.tsv"
-        )
+        possible_paths = [
+            (
+                bids_root
+                / subject
+                / "eeg"
+                / f"{subject}_task-N400Stimset_events.tsv"
+            ),
+            (
+                bids_root
+                / subject
+                / f"{subject}_task-N400Stimset_events.tsv"
+            ),
+        ]
 
-        if not events_path.exists():
+        if not any(
+            path.exists()
+            for path in possible_paths
+        ):
             missing_events_files.append(
-                events_path
+                possible_paths
             )
 
     if missing_events_files:
-        examples = "\n".join(
-            str(path)
-            for path in missing_events_files[:10]
+        examples = "\n\n".join(
+            "Checked:\n"
+            + "\n".join(
+                str(path)
+                for path in paths
+            )
+            for paths in missing_events_files[:10]
         )
 
         raise FileNotFoundError(
             "Subject events files required for matching retained "
-            "ERP trials to stimuli were not found.\n"
-            f"{examples}\n"
-            "The --bids-root argument must point to the original "
-            "N400 BIDS dataset root."
+            "ERP trials were not found.\n"
+            f"{examples}"
         )
 
     print(
@@ -1620,12 +1758,12 @@ def main():
     )
 
     print(
-        f"Using original BIDS root: {bids_root}"
+        f"Using events root: {bids_root}"
     )
 
     print(
-        "Using stimulus parameters file: "
-        f"{stimulus_parameters_path}"
+        "Using language stimulus table: "
+        f"{language_metrics_path}"
     )
 
     output_dir.mkdir(
@@ -1637,12 +1775,12 @@ def main():
     failed_files = []
 
     for mat_path in mat_files:
-
         try:
             out_path = export_long_for_file(
                 mat_path=mat_path,
                 output_dir=output_dir,
                 bids_root=bids_root,
+                stimulus_lookup=stimulus_lookup,
             )
 
             output_files.append(
@@ -1699,7 +1837,6 @@ def main():
     first_chunk = True
 
     for path in output_files:
-
         print(
             f"  Adding: {path.name}"
         )
@@ -1737,7 +1874,9 @@ def main():
             f"{len(failed_files)} ERP files failed."
         )
 
-    print("\nDone.")
+    print(
+        "\nDone."
+    )
 
 
 if __name__ == "__main__":
