@@ -394,6 +394,8 @@ def component_average_chunked(
     """
     Compute component mean amplitude from retained ERP trials.
 
+    Supports both comma-separated CSV files and tab-separated TSV files.
+
     Each retained subject/condition/trial remains a separate observation.
     """
 
@@ -409,6 +411,18 @@ def component_average_chunked(
         "amplitude",
     ]
 
+    suffix = erp_long_path.suffix.lower()
+
+    if suffix == ".tsv":
+        separator = "\t"
+    elif suffix == ".csv":
+        separator = ","
+    else:
+        raise ValueError(
+            "ERP long file must have a .csv or .tsv extension: "
+            f"{erp_long_path}"
+        )
+
     partials = []
 
     log.info(
@@ -417,9 +431,17 @@ def component_average_chunked(
         erp_long_path,
     )
 
+    log.info(
+        "Using delimiter: %s",
+        "TAB"
+        if separator == "\t"
+        else "COMMA",
+    )
+
     for chunk_number, chunk in enumerate(
         pd.read_csv(
             erp_long_path,
+            sep=separator,
             chunksize=chunksize,
         ),
         start=1,
@@ -463,6 +485,30 @@ def component_average_chunked(
             chunk["amplitude"],
             errors="coerce",
         )
+
+        invalid_time_rows = (
+            chunk["time"]
+            .isna()
+        )
+
+        if invalid_time_rows.any():
+            raise ValueError(
+                "ERP long file contains "
+                f"{invalid_time_rows.sum()} invalid time values "
+                f"in chunk {chunk_number}."
+            )
+
+        invalid_amplitude_rows = (
+            chunk["amplitude"]
+            .isna()
+        )
+
+        if invalid_amplitude_rows.any():
+            raise ValueError(
+                "ERP long file contains "
+                f"{invalid_amplitude_rows.sum()} invalid amplitude values "
+                f"in chunk {chunk_number}."
+            )
 
         selected = select_component_rows(
             chunk=chunk,
@@ -564,6 +610,16 @@ def component_average_chunked(
             ),
         )
     )
+
+    zero_count_rows = (
+        final["amplitude_n"] <= 0
+    )
+
+    if zero_count_rows.any():
+        raise ValueError(
+            "Some component averages contain zero valid "
+            "amplitude observations."
+        )
 
     final[outcome] = (
         final["amplitude_sum"]

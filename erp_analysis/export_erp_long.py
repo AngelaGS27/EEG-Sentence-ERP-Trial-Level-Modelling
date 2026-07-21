@@ -942,7 +942,7 @@ def export_long_for_file(
     bids_root: Path,
 ):
     """
-    Export one subject's CP ERP derivative to long-format CSV.
+    Export one subject's CP ERP derivative to long-format TSV.
 
     For every retained ERP trial, this function:
 
@@ -1021,7 +1021,6 @@ def export_long_for_file(
                 f"{len(rejection_summary)} versus {n_conditions}"
             )
 
-        # Permit a maximum timing difference of two EEG samples.
         tolerance_seconds = (
             2.0
             / sampling_frequency
@@ -1149,7 +1148,7 @@ def export_long_for_file(
 
             print(
                 f"  Condition {condition_number}: "
-                f"{condition_label} — "
+                f"{condition_label} - "
                 f"{n_trials} retained trials x "
                 f"{n_timepoints} timepoints x "
                 f"{n_channels} channels"
@@ -1243,7 +1242,6 @@ def export_long_for_file(
                             "item": lookup_row[
                                 "stim_key"
                             ],
-
                             "channel": metadata[
                                 "channel"
                             ],
@@ -1257,7 +1255,6 @@ def export_long_for_file(
                                 "standard_label",
                                 "",
                             ),
-
                             "x": metadata.get(
                                 "x",
                                 np.nan,
@@ -1290,7 +1287,6 @@ def export_long_for_file(
                                 "radius",
                                 np.nan,
                             ),
-
                             "channel_status": metadata.get(
                                 "status",
                                 np.nan,
@@ -1299,7 +1295,6 @@ def export_long_for_file(
                                 "status_description",
                                 np.nan,
                             ),
-
                             "time": times,
                             "amplitude": amplitudes,
                         }
@@ -1419,7 +1414,7 @@ def export_long_for_file(
 
     out_path = (
         output_dir
-        / f"{subject}_erp_long.csv"
+        / f"{subject}_erp_long.tsv"
     )
 
     lookup_path = (
@@ -1429,6 +1424,7 @@ def export_long_for_file(
 
     out.to_csv(
         out_path,
+        sep="\t",
         index=False,
     )
 
@@ -1452,20 +1448,26 @@ def main():
 
     parser = argparse.ArgumentParser(
         description=(
-            "Export ERP .mat files to long-format EEG CSV "
+            "Export ERP .mat files to long-format EEG TSV "
             "with stimulus identifiers and channel coordinates."
         )
     )
 
     parser.add_argument(
         "erp_root",
-        help="Path to the derivatives/erps folder.",
+        help=(
+            "Path to the ERP derivatives folder containing "
+            "sub-*/*_erp-CP.mat files."
+        ),
     )
 
     parser.add_argument(
         "--output-dir",
         default="eeg_outputs",
-        help="Folder where EEG CSV files will be saved.",
+        help=(
+            "Folder where participant and combined EEG TSV "
+            "files will be saved."
+        ),
     )
 
     parser.add_argument(
@@ -1481,9 +1483,17 @@ def main():
 
     args = parser.parse_args()
 
-    erp_root = Path(args.erp_root)
-    output_dir = Path(args.output_dir)
-    bids_root = Path(args.bids_root)
+    erp_root = Path(
+        args.erp_root
+    )
+
+    output_dir = Path(
+        args.output_dir
+    )
+
+    bids_root = Path(
+        args.bids_root
+    )
 
     if not erp_root.exists():
         raise FileNotFoundError(
@@ -1547,6 +1557,8 @@ def main():
 
     output_files = []
 
+    failed_files = []
+
     for mat_path in mat_files:
 
         try:
@@ -1566,49 +1578,92 @@ def main():
                 f"FAILED: {mat_path.name}: {error}"
             )
 
-    if output_files:
-
-        print(
-            "\nCombining subject CSV files safely in chunks..."
-        )
-
-        combined_path = (
-            output_dir
-            / "ALL_erp_long.csv"
-        )
-
-        if combined_path.exists():
-            combined_path.unlink()
-
-        first_chunk = True
-
-        for path in output_files:
-
-            print(
-                f"  Adding: {path.name}"
+            failed_files.append(
+                {
+                    "file": str(mat_path),
+                    "error": str(error),
+                }
             )
 
-            for chunk in pd.read_csv(
-                path,
-                chunksize=500_000,
-            ):
-                chunk.to_csv(
-                    combined_path,
-                    mode=(
-                        "w"
-                        if first_chunk
-                        else "a"
-                    ),
-                    header=first_chunk,
-                    index=False,
-                )
+    if not output_files:
+        raise RuntimeError(
+            "No participant ERP files were exported successfully."
+        )
 
-                first_chunk = False
+    print(
+        "\nCombining subject TSV files safely in chunks..."
+    )
+
+    combined_path = (
+        output_dir
+        / "ALL_erp_long.tsv"
+    )
+
+    if combined_path.exists():
+        combined_path.unlink()
+
+    first_chunk = True
+
+    for path in output_files:
 
         print(
-            "Saved combined EEG long file: "
-            f"{combined_path}"
+            f"  Adding: {path.name}"
         )
+
+        for chunk in pd.read_csv(
+            path,
+            sep="\t",
+            chunksize=500_000,
+        ):
+            chunk.to_csv(
+                combined_path,
+                sep="\t",
+                mode=(
+                    "w"
+                    if first_chunk
+                    else "a"
+                ),
+                header=first_chunk,
+                index=False,
+            )
+
+            first_chunk = False
+
+    print(
+        "Saved combined EEG long file: "
+        f"{combined_path}"
+    )
+
+    if failed_files:
+        output_dir.mkdir(
+            parents=True,
+            exist_ok=True,
+        )
+
+        failed_path = (
+            output_dir
+            / "failed_erp_exports.tsv"
+        )
+
+        pd.DataFrame(
+            failed_files
+        ).to_csv(
+            failed_path,
+            sep="\t",
+            index=False,
+        )
+
+        print(
+            f"Saved failed-export report: {failed_path}"
+        )
+
+        print(
+            f"{len(failed_files)} ERP files failed."
+        )
+
+    print(
+        f"{len(output_files)} ERP files exported successfully."
+    )
 
     print("\nDone.")
 
