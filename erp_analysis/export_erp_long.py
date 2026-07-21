@@ -38,39 +38,113 @@ def dereference_numeric_cell(
     ).astype(float)
 
 def get_subject_id(path: Path) -> str:
+    """
+    Extract the subject identifier from an ERP filename.
+    """
+
     name = path.name
 
     if "_task-" in name:
-        return name.split("_task-")[0]
+        return name.split(
+            "_task-",
+            1,
+        )[0]
 
     return path.stem
 
 
-def extract_condition_object(file, erps_dataset, condition_index):
-    """Follow ERP object reference."""
-    ref = erps_dataset[0, condition_index]
-    return file[ref]
-
-
-def extract_data(condition_group):
+def get_analysis_name(path: Path) -> str:
     """
-    Extract EEG data.
+    Extract the ERP analysis name from the filename.
 
-    Expected dataset structure:
+    Examples:
+        sub-24_task-N400Stimset_erp-CP.mat
+            -> CP
+
+        sub-24_task-N400Stimset_erp-GA.mat
+            -> GA
+
+        sub-24_task-N400Stimset_erp-LD.mat
+            -> LD
+
+        sub-24_task-N400Stimset_erp-Order.mat
+            -> Order
+
+        sub-24_task-N400Stimset_erp-Time.mat
+            -> Time
+    """
+
+    marker = "_erp-"
+
+    if marker not in path.stem:
+        raise ValueError(
+            "Cannot identify ERP analysis from filename: "
+            f"{path.name}"
+        )
+
+    return path.stem.split(
+        marker,
+        1,
+    )[1]
+
+
+def extract_condition_object(
+    file,
+    erps_dataset,
+    condition_index,
+):
+    """
+    Follow one ERP condition object reference.
+    """
+
+    reference = erps_dataset[
+        0,
+        condition_index,
+    ]
+
+    return file[
+        reference
+    ]
+
+
+def extract_data(
+    condition_group,
+):
+    """
+    Extract ERP data.
+
+    Expected shape:
         trials x timepoints x channels
     """
 
     if "data" not in condition_group:
-        raise KeyError("No 'data' field found.")
+        raise KeyError(
+            "No 'data' field found in ERP condition."
+        )
 
-    data = np.array(condition_group["data"])
+    data = np.asarray(
+        condition_group[
+            "data"
+        ]
+    )
 
     if data.ndim != 3:
-        raise ValueError(f"Expected 3D data, got {data.shape}")
+        raise ValueError(
+            "Expected three-dimensional ERP data, "
+            f"but found shape {data.shape}."
+        )
 
-    trials, timepoints, channels = data.shape
+    n_trials = data.shape[0]
+    n_timepoints = data.shape[1]
+    n_channels = data.shape[2]
 
-    return data, trials, timepoints, channels
+    return (
+        data,
+        n_trials,
+        n_timepoints,
+        n_channels,
+    )
+
 
 def extract_epoch_urevent_indices(
     file: h5py.File,
@@ -78,10 +152,11 @@ def extract_epoch_urevent_indices(
     n_trials: int,
 ) -> list[int]:
     """
-    Extract the original EEGLAB urevent index for each retained epoch.
+    Extract the original EEGLAB urevent index for every
+    retained ERP epoch.
 
-    The derivative ERP files contain one epoch/eventurevent cell
-    for every surviving trial.
+    The resulting indices preserve the retained epoch order
+    stored inside the ERP MAT file.
     """
 
     if "epoch" not in condition_group:
@@ -89,11 +164,13 @@ def extract_epoch_urevent_indices(
             "No epoch structure found in ERP condition."
         )
 
-    epoch_group = condition_group["epoch"]
+    epoch_group = condition_group[
+        "epoch"
+    ]
 
     if "eventurevent" not in epoch_group:
         raise KeyError(
-            "No epoch/eventurevent field found."
+            "No epoch/eventurevent field found in ERP condition."
         )
 
     eventurevent = epoch_group[
@@ -102,9 +179,8 @@ def extract_epoch_urevent_indices(
 
     if eventurevent.shape[0] != n_trials:
         raise ValueError(
-            "eventurevent row count does not match "
-            f"the number of retained trials: "
-            f"{eventurevent.shape[0]} versus {n_trials}"
+            "eventurevent row count does not match retained "
+            f"trials: {eventurevent.shape[0]} versus {n_trials}"
         )
 
     indices = []
@@ -119,18 +195,19 @@ def extract_epoch_urevent_indices(
         )
 
         finite_values = values[
-            np.isfinite(values)
+            np.isfinite(
+                values
+            )
         ]
 
-        if len(finite_values) == 0:
+        if len(
+            finite_values
+        ) == 0:
             raise ValueError(
-                "No valid urevent index found for "
-                f"retained trial {trial_index + 1}."
+                "No valid urevent index for retained trial "
+                f"{trial_index + 1}."
             )
 
-        # Epochs can theoretically contain more than one event.
-        # The target epoch in these derivative files contains one
-        # relevant original urevent reference.
         urevent_index = int(
             round(
                 float(
@@ -141,7 +218,8 @@ def extract_epoch_urevent_indices(
 
         if urevent_index < 1:
             raise ValueError(
-                f"Invalid EEGLAB urevent index: {urevent_index}"
+                "Invalid EEGLAB urevent index: "
+                f"{urevent_index}"
             )
 
         indices.append(
@@ -150,283 +228,255 @@ def extract_epoch_urevent_indices(
 
     return indices
 
-def extract_urevent_latency_seconds(
-    file: h5py.File,
-    condition_group,
-    urevent_index: int,
-    sampling_frequency: float,
-) -> float:
+
+def extract_times(
+    file,
+):
     """
-    Convert an original EEGLAB urevent latency to seconds.
+    Extract the ERP time vector.
+
+    Converts milliseconds to seconds when the stored values
+    are clearly in milliseconds.
     """
-
-    if "urevent" not in condition_group:
-        raise KeyError(
-            "No urevent structure found in ERP condition."
-        )
-
-    urevent_group = condition_group[
-        "urevent"
-    ]
-
-    if "latency" not in urevent_group:
-        raise KeyError(
-            "No urevent/latency field found."
-        )
-
-    latency_dataset = urevent_group[
-        "latency"
-    ]
-
-    zero_based_index = (
-        urevent_index - 1
-    )
-
-    if (
-        zero_based_index < 0
-        or zero_based_index
-        >= latency_dataset.shape[0]
-    ):
-        raise IndexError(
-            "urevent index is outside the stored "
-            f"urevent table: {urevent_index}"
-        )
-
-    values = dereference_numeric_cell(
-        file=file,
-        dataset=latency_dataset,
-        row_index=zero_based_index,
-    )
-
-    finite_values = values[
-        np.isfinite(values)
-    ]
-
-    if len(finite_values) == 0:
-        raise ValueError(
-            f"No valid latency found for urevent {urevent_index}."
-        )
-
-    latency_samples = float(
-        finite_values[0]
-    )
-
-    latency_seconds = (
-        latency_samples - 1.0
-    ) / sampling_frequency
-
-    return latency_seconds
-
-def extract_times(file):
-    """Extract time vector."""
 
     if "t" not in file:
-        raise KeyError("No time vector 't' found.")
+        raise KeyError(
+            "No time vector 't' found in ERP MAT file."
+        )
 
-    times = np.array(file["t"]).squeeze()
+    times = np.asarray(
+        file[
+            "t"
+        ]
+    ).squeeze().astype(
+        float
+    )
 
-    # Convert ms -> seconds if necessary
-    if np.nanmax(np.abs(times)) > 10:
-        times = times / 1000.0
+    if times.ndim != 1:
+        raise ValueError(
+            "ERP time vector is not one-dimensional: "
+            f"{times.shape}"
+        )
+
+    if len(
+        times
+    ) == 0:
+        raise ValueError(
+            "ERP time vector is empty."
+        )
+
+    if not np.isfinite(
+        times
+    ).all():
+        raise ValueError(
+            "ERP time vector contains missing or infinite values."
+        )
+
+    if np.nanmax(
+        np.abs(
+            times
+        )
+    ) > 10:
+        times = (
+            times
+            / 1000.0
+        )
 
     return times
 
-def make_biosemi_128_label(index: int) -> str:
+
+def make_biosemi_128_label(
+    index: int,
+) -> str:
     """
-    Convert channel index to BioSemi 128 label.
+    Convert a zero-based channel index to a BioSemi 128 label.
 
-    index 0  -> A1
-    index 31 -> A32
-    index 32 -> B1
-    index 63 -> B32
-    index 64 -> C1
-    index 95 -> C32
-    index 96 -> D1
+    Examples:
+        0   -> A1
+        31  -> A32
+        32  -> B1
+        63  -> B32
+        64  -> C1
+        95  -> C32
+        96  -> D1
+        127 -> D32
     """
-    letters = ["A", "B", "C", "D"]
 
-    if index < 0 or index >= 128:
-        return f"ch_{index + 1:03d}"
+    letters = [
+        "A",
+        "B",
+        "C",
+        "D",
+    ]
 
-    letter = letters[index // 32]
-    number = (index % 32) + 1
+    if (
+        index < 0
+        or index >= 128
+    ):
+        return (
+            f"ch_{index + 1:03d}"
+        )
 
-    return f"{letter}{number}"
+    letter = letters[
+        index // 32
+    ]
 
-def extract_channel_labels(file, condition_group, n_channels):
+    number = (
+        index % 32
+    ) + 1
+
+    return (
+        f"{letter}{number}"
+    )
+
+
+def extract_channel_labels(
+    file,
+    condition_group,
+    n_channels,
+):
     """
-    Extract channel labels if possible.
+    Extract channel labels from the ERP MAT file.
 
-    If labels cannot be extracted from the .mat file, assume BioSemi 128 order:
-        A1-A32, B1-B32, C1-C32, D1-D32
+    If labels cannot be read, use BioSemi 128 acquisition
+    labels in channel order.
     """
 
     labels = []
 
     try:
-        chanlocs = condition_group["chanlocs"]
+        chanlocs = condition_group[
+            "chanlocs"
+        ]
 
         if "labels" in chanlocs:
-            label_refs = chanlocs["labels"]
+            label_references = chanlocs[
+                "labels"
+            ]
 
-            for i in range(label_refs.shape[0]):
-                ref = label_refs[i, 0]
-                labels.append(decode_matlab_string(file, ref))
+            for channel_index in range(
+                label_references.shape[0]
+            ):
+                reference = label_references[
+                    channel_index,
+                    0,
+                ]
+
+                labels.append(
+                    decode_matlab_string(
+                        file,
+                        reference,
+                    )
+                )
 
     except Exception:
         labels = []
 
-    if len(labels) != n_channels or any(label == "" for label in labels):
+    invalid_labels = (
+        len(
+            labels
+        ) != n_channels
+        or any(
+            not str(
+                label
+            ).strip()
+            for label in labels
+        )
+    )
+
+    if invalid_labels:
         labels = [
-            make_biosemi_128_label(i)
-            for i in range(n_channels)
+            make_biosemi_128_label(
+                channel_index
+            )
+            for channel_index in range(
+                n_channels
+            )
         ]
 
     return labels
 
-def clean_electrode_name(value):
+
+def clean_electrode_name(
+    value,
+):
     """
-    Clean electrode labels.
+    Clean an electrode label.
     """
-    value = str(value).strip().strip("'").strip('"')
+
+    value = (
+        str(
+            value
+        )
+        .strip()
+        .strip("'")
+        .strip('"')
+    )
 
     if "_" in value:
-        value = value.split("_", 1)[0]
+        value = value.split(
+            "_",
+            1,
+        )[0]
 
     return value.strip()
 
 
-def split_channel_name(channel_name):
+def split_channel_name(
+    channel_name,
+):
     """
-    Split labels like A1_Cz into:
+    Split labels such as A1_Cz into:
+
         electrode = A1
         standard_label = Cz
+
+    Labels without an underscore retain only the acquisition
+    electrode name.
     """
-    channel_name = str(channel_name).strip()
+
+    channel_name = str(
+        channel_name
+    ).strip()
 
     if "_" in channel_name:
-        electrode, standard = channel_name.split("_", 1)
-        return clean_electrode_name(electrode), standard.strip()
-
-    return clean_electrode_name(channel_name), ""
-
-
-def load_electrode_coordinates(bids_root: Path) -> pd.DataFrame:
-    """
-    Load task-N400Stimset_electrodes.tsv.
-
-    Expected columns:
-        name, X, Y, Z, sph_theta, sph_phi, sph_radius, theta, radius
-    """
-
-    electrodes_path = bids_root / "task-N400Stimset_electrodes.tsv"
-
-    if not electrodes_path.exists():
-        raise FileNotFoundError(
-            f"Electrodes file not found: {electrodes_path}"
+        electrode, standard_label = channel_name.split(
+            "_",
+            1,
         )
 
-    electrodes = pd.read_csv(electrodes_path, sep="\t")
-
-    electrodes["electrode"] = electrodes["name"].map(clean_electrode_name)
-
-    electrodes = electrodes.rename(
-        columns={
-            "X": "x",
-            "Y": "y",
-            "Z": "z",
-        }
-    )
-
-    keep_cols = [
-        "electrode",
-        "x",
-        "y",
-        "z",
-        "sph_theta",
-        "sph_phi",
-        "sph_radius",
-        "theta",
-        "radius",
-    ]
-
-    existing = [col for col in keep_cols if col in electrodes.columns]
-
-    return electrodes[existing]
-
-
-def load_subject_channel_metadata(bids_root: Path, subject: str) -> pd.DataFrame:
-    """
-    Load subject channels.tsv.
-    """
-
-    possible_paths = [
-        bids_root / subject / "eeg" / f"{subject}_task-N400Stimset_channels.tsv",
-        bids_root / subject / f"{subject}_task-N400Stimset_channels.tsv",
-    ]
-
-    channels_path = None
-
-    for path in possible_paths:
-        if path.exists():
-            channels_path = path
-            break
-
-    if channels_path is None:
-        raise FileNotFoundError(
-            "Channels file not found. Checked:\n"
-            + "\n".join(str(path) for path in possible_paths)
+        return (
+            clean_electrode_name(
+                electrode
+            ),
+            standard_label.strip(),
         )
 
-    channels = pd.read_csv(channels_path, sep="\t")
-
-    channels["original_channel"] = channels["name"].astype(str)
-
-    split = channels["name"].map(split_channel_name)
-
-    channels["electrode"] = split.map(lambda x: x[0])
-    channels["standard_label"] = split.map(lambda x: x[1])
-
-    channels["channel_clean"] = channels.apply(
-        lambda row: (
-            row["standard_label"]
-            if row["standard_label"] != ""
-            else row["electrode"]
+    return (
+        clean_electrode_name(
+            channel_name
         ),
-        axis=1,
+        "",
     )
-
-    return channels[
-        [
-            "original_channel",
-            "electrode",
-            "standard_label",
-            "channel_clean",
-            "type",
-            "units",
-            "status",
-            "status_description",
-        ]
-    ]
 
 
 def build_channel_metadata(
-    bids_root: Path,
-    subject: str,
     channel_labels: list[str],
 ) -> pd.DataFrame:
     """
-    Build channel metadata directly from channel labels stored
-    inside the ERP MAT file.
+    Build channel metadata directly from labels stored in the
+    ERP MAT file.
 
-    The bids_root and subject arguments remain in the signature
-    so that existing calls do not need to be changed.
-
+    No external channels.tsv, electrodes.tsv, or BIDS directory
+    is required.
     """
 
     rows = []
 
-    for channel_index, channel_label in enumerate(
+    for (
+        channel_index,
+        channel_label,
+    ) in enumerate(
         channel_labels
     ):
         channel_label = str(
@@ -443,7 +493,10 @@ def build_channel_metadata(
                 channel_index
             )
 
-        electrode, standard_label = split_channel_name(
+        (
+            electrode,
+            standard_label,
+        ) = split_channel_name(
             channel_label
         )
 
@@ -480,526 +533,78 @@ def build_channel_metadata(
         rows
     )
 
-    if len(channel_metadata) != len(
+    if len(
+        channel_metadata
+    ) != len(
         channel_labels
     ):
         raise ValueError(
             "Channel metadata count does not match "
-            "the number of MAT-file channel labels."
+            "the number of channel labels."
         )
 
     return channel_metadata
 
-def normalise_stim_file(series: pd.Series) -> pd.Series:
+
+def get_trial_rejection_path(
+    mat_path: Path,
+) -> Path:
     """
-    Normalise stimulus filenames before matching.
-    """
-    return (
-        series
-        .astype("string")
-        .str.strip()
-        .str.replace("\\", "/", regex=False)
-        .str.rsplit("/", n=1)
-        .str[-1]
-    )
+    Construct the exact paired trial-rejection TSV path.
 
+    Examples:
 
-def load_stimulus_lookup(
-    language_metrics_path: Path,
-) -> pd.DataFrame:
-    """
-    Load the complete language-output table and construct a unique
-    stim_file -> stim_key lookup.
+        sub-24_task-N400Stimset_erp-CP.mat
+        sub-24_task-N400Stimset_erp-CP_trialrej.tsv
 
-    Expected language-output file:
-        language_outputs/ALL_language_metrics.tsv
+        sub-24_task-N400Stimset_erp-GA.mat
+        sub-24_task-N400Stimset_erp-GA_trialrej.tsv
 
-    The full language metrics table is used because it contains both
-    stim_file and stim_key.
+        sub-24_task-N400Stimset_erp-LD.mat
+        sub-24_task-N400Stimset_erp-LD_trialrej.tsv
+
+        sub-24_task-N400Stimset_erp-Order.mat
+        sub-24_task-N400Stimset_erp-Order_trialrej.tsv
+
+        sub-24_task-N400Stimset_erp-Time.mat
+        sub-24_task-N400Stimset_erp-Time_trialrej.tsv
     """
 
-    language_metrics_path = Path(
-        language_metrics_path
-    ).expanduser().resolve()
-
-    if not language_metrics_path.exists():
-        raise FileNotFoundError(
-            "Language metrics file not found: "
-            f"{language_metrics_path}"
-        )
-
-    if not language_metrics_path.is_file():
-        raise FileNotFoundError(
-            "Language metrics path is not a file: "
-            f"{language_metrics_path}"
-        )
-
-    stimuli = pd.read_csv(
-        language_metrics_path,
-        sep="\t",
+    return mat_path.with_name(
+        f"{mat_path.stem}_trialrej.tsv"
     )
 
-    required_columns = [
-        "stim_file",
-        "stim_key",
-    ]
-
-    missing_columns = [
-        column
-        for column in required_columns
-        if column not in stimuli.columns
-    ]
-
-    if missing_columns:
-        raise ValueError(
-            "Language metrics table is missing required "
-            f"columns: {missing_columns}. "
-            "ALL_language_metrics.tsv must contain both "
-            "stim_file and stim_key."
-        )
-
-    stimuli = stimuli.copy()
-
-    stimuli["stim_file"] = normalise_stim_file(
-        stimuli["stim_file"]
-    )
-
-    stimuli["stim_key"] = (
-        stimuli["stim_key"]
-        .astype("string")
-        .str.strip()
-    )
-
-    missing_stim_file = (
-        stimuli["stim_file"].isna()
-        | stimuli["stim_file"].eq("")
-    )
-
-    if missing_stim_file.any():
-        raise ValueError(
-            "Language metrics table contains "
-            f"{int(missing_stim_file.sum())} missing or empty "
-            "stim_file values."
-        )
-
-    missing_stim_key = (
-        stimuli["stim_key"].isna()
-        | stimuli["stim_key"].eq("")
-    )
-
-    if missing_stim_key.any():
-        raise ValueError(
-            "Language metrics table contains "
-            f"{int(missing_stim_key.sum())} missing or empty "
-            "stim_key values."
-        )
-
-    conflicting_file_mappings = (
-        stimuli
-        .groupby(
-            "stim_file",
-            dropna=False,
-        )["stim_key"]
-        .nunique(
-            dropna=False
-        )
-    )
-
-    conflicting_file_mappings = (
-        conflicting_file_mappings[
-            conflicting_file_mappings > 1
-        ]
-    )
-
-    if not conflicting_file_mappings.empty:
-        raise ValueError(
-            "Some stimulus filenames in the language metrics table "
-            "map to multiple stim_key values. Examples: "
-            f"{conflicting_file_mappings.index[:10].tolist()}"
-        )
-
-    lookup = (
-        stimuli[
-            [
-                "stim_file",
-                "stim_key",
-            ]
-        ]
-        .drop_duplicates(
-            subset="stim_file"
-        )
-        .reset_index(
-            drop=True
-        )
-    )
-
-    duplicate_key_mappings = (
-        lookup
-        .groupby(
-            "stim_key",
-            dropna=False,
-        )["stim_file"]
-        .nunique(
-            dropna=False
-        )
-    )
-
-    duplicate_key_mappings = (
-        duplicate_key_mappings[
-            duplicate_key_mappings > 1
-        ]
-    )
-
-    if not duplicate_key_mappings.empty:
-        print(
-            "Warning: some stim_key values correspond to more than "
-            "one stimulus filename. Matching will remain based on "
-            "stim_file. Examples: "
-            f"{duplicate_key_mappings.index[:10].tolist()}"
-        )
-
-    print(
-        f"Loaded {len(lookup)} stimulus mappings "
-        f"from {language_metrics_path}"
-    )
-
-    return lookup
-
-def load_subject_events(
-    bids_root: Path,
-    subject: str,
-    stimulus_lookup: pd.DataFrame,
-) -> pd.DataFrame:
-    """
-    Load one subject's events table and attach stim_key by matching
-    each event's stim_file to the mapping loaded from
-    language_outputs/ALL_language_metrics.tsv.
-    """
-
-    possible_paths = [
-        (
-            bids_root
-            / subject
-            / "eeg"
-            / f"{subject}_task-N400Stimset_events.tsv"
-        ),
-        (
-            bids_root
-            / subject
-            / f"{subject}_task-N400Stimset_events.tsv"
-        ),
-    ]
-
-    events_path = next(
-        (
-            path
-            for path in possible_paths
-            if path.exists()
-        ),
-        None,
-    )
-
-    if events_path is None:
-        raise FileNotFoundError(
-            "Events file not found. Checked:\n"
-            + "\n".join(
-                str(path)
-                for path in possible_paths
-            )
-        )
-
-    events = pd.read_csv(
-        events_path,
-        sep="\t",
-    )
-
-    required_columns = [
-        "onset",
-        "trial_type",
-        "stim_file",
-    ]
-
-    missing_columns = [
-        column
-        for column in required_columns
-        if column not in events.columns
-    ]
-
-    if missing_columns:
-        raise ValueError(
-            f"{events_path} is missing required "
-            f"columns: {missing_columns}"
-        )
-
-    events = events.copy()
-
-    events["original_event_row"] = range(
-        1,
-        len(events) + 1,
-    )
-
-    events["trial_type"] = (
-        events["trial_type"]
-        .astype("string")
-        .str.strip()
-        .str.upper()
-    )
-
-    events = events[
-        events["trial_type"].isin(
-            [
-                "NPC",
-                "NPI",
-            ]
-        )
-    ].copy()
-
-    if events.empty:
-        raise ValueError(
-            f"No NPC or NPI sentence events found in {events_path}"
-        )
-
-    events["target_onset_seconds"] = pd.to_numeric(
-        events["onset"],
-        errors="coerce",
-    )
-
-    invalid_onsets = (
-        events["target_onset_seconds"].isna()
-        | ~np.isfinite(
-            events["target_onset_seconds"]
-        )
-    )
-
-    if invalid_onsets.any():
-        raise ValueError(
-            "Some NPC/NPI events have missing or invalid "
-            "target-word onset values."
-        )
-
-    events["stim_file"] = normalise_stim_file(
-        events["stim_file"]
-    )
-
-    missing_event_stimuli = (
-        events["stim_file"].isna()
-        | events["stim_file"].eq("")
-    )
-
-    if missing_event_stimuli.any():
-        raise ValueError(
-            "Some NPC/NPI events contain missing or empty "
-            "stim_file values."
-        )
-
-    events = events.merge(
-        stimulus_lookup,
-        on="stim_file",
-        how="left",
-        validate="many_to_one",
-        sort=False,
-        indicator=True,
-    )
-
-    unmatched = (
-        events["_merge"] != "both"
-    )
-
-    if unmatched.any():
-        examples = (
-            events.loc[
-                unmatched,
-                "stim_file",
-            ]
-            .drop_duplicates()
-            .head(10)
-            .tolist()
-        )
-
-        raise ValueError(
-            f"{int(unmatched.sum())} event rows in {events_path} "
-            "could not be matched to "
-            "language_outputs/ALL_language_metrics.tsv using "
-            f"stim_file. Examples: {examples}"
-        )
-
-    events = events.drop(
-        columns="_merge"
-    )
-
-    missing_matched_keys = (
-        events["stim_key"].isna()
-        | events["stim_key"].astype("string").str.strip().eq("")
-    )
-
-    if missing_matched_keys.any():
-        raise ValueError(
-            "Some matched experimental events still have missing "
-            "stim_key values."
-        )
-
-    events = events.sort_values(
-        "target_onset_seconds"
-    ).reset_index(
-        drop=True
-    )
-
-    events["experimental_trial"] = range(
-        1,
-        len(events) + 1,
-    )
-
-    print(
-        f"  Loaded {len(events)} experimental events "
-        f"for {subject}: "
-        f"{int((events['trial_type'] == 'NPC').sum())} NPC and "
-        f"{int((events['trial_type'] == 'NPI').sum())} NPI"
-    )
-
-    return events[
-        [
-            "original_event_row",
-            "experimental_trial",
-            "trial_type",
-            "target_onset_seconds",
-            "stim_file",
-            "stim_key",
-        ]
-    ]
-
-def match_retained_trials_to_events(
-    urevent_indices: list[int],
-    file: h5py.File,
-    condition_group,
-    events: pd.DataFrame,
-    sampling_frequency: float,
-    tolerance_seconds: float,
-) -> pd.DataFrame:
-    """
-    Match retained ERP epochs to subject events using target-word onset.
-
-    For each retained trial:
-        eventurevent
-            -> original urevent latency
-            -> closest BIDS target-word onset
-            -> stim_file
-            -> stim_key
-    """
-
-    matches = []
-    used_event_rows = set()
-
-    event_onsets = events[
-        "target_onset_seconds"
-    ].to_numpy(
-        dtype=float
-    )
-
-    for retained_trial, urevent_index in enumerate(
-        urevent_indices,
-        start=1,
-    ):
-        urevent_seconds = extract_urevent_latency_seconds(
-            file=file,
-            condition_group=condition_group,
-            urevent_index=urevent_index,
-            sampling_frequency=sampling_frequency,
-        )
-
-        differences = np.abs(
-            event_onsets
-            - urevent_seconds
-        )
-
-        closest_position = int(
-            np.argmin(
-                differences
-            )
-        )
-
-        closest_difference = float(
-            differences[
-                closest_position
-            ]
-        )
-
-        if closest_difference > tolerance_seconds:
-            raise ValueError(
-                "Could not safely match retained ERP trial "
-                f"{retained_trial}. Urevent {urevent_index} "
-                f"occurs at {urevent_seconds:.6f} seconds, "
-                "but the closest target-word onset is "
-                f"{closest_difference:.6f} seconds away."
-            )
-
-        event_row = events.iloc[
-            closest_position
-        ]
-
-        original_event_row = int(
-            event_row[
-                "original_event_row"
-            ]
-        )
-
-        if original_event_row in used_event_rows:
-            raise ValueError(
-                "Two retained ERP trials matched the same "
-                f"events.tsv row: {original_event_row}"
-            )
-
-        used_event_rows.add(
-            original_event_row
-        )
-
-        matches.append(
-            {
-                "retained_trial": retained_trial,
-                "urevent_index": urevent_index,
-                "urevent_seconds": urevent_seconds,
-                "event_time_difference_seconds": closest_difference,
-                "original_event_row": original_event_row,
-                "experimental_trial": int(
-                    event_row[
-                        "experimental_trial"
-                    ]
-                ),
-                "trial_type": event_row[
-                    "trial_type"
-                ],
-                "target_onset_seconds": float(
-                    event_row[
-                        "target_onset_seconds"
-                    ]
-                ),
-                "stim_file": event_row[
-                    "stim_file"
-                ],
-                "stim_key": event_row[
-                    "stim_key"
-                ],
-            }
-        )
-
-    return pd.DataFrame(
-        matches
-    )
 
 def load_trial_rejection_summary(
     mat_path: Path,
 ) -> pd.DataFrame:
     """
-    Load the trial-rejection summary paired with an ERP MAT file.
+    Load the trial-rejection TSV paired with one ERP MAT file.
+
+    Required columns:
+
+        condition
+        before_trial_rejection
+        after_trial_rejection
+
+    An optional '#' column is used as the condition index when
+    present.
     """
 
-    rejection_path = mat_path.with_name(
-        mat_path.stem
-        + "_trialrej.tsv"
+    rejection_path = get_trial_rejection_path(
+        mat_path
     )
 
     if not rejection_path.exists():
         raise FileNotFoundError(
-            "Trial-rejection summary not found: "
+            "Trial-rejection TSV not found for ERP MAT file:\n"
+            f"MAT: {mat_path}\n"
+            f"Expected TSV: {rejection_path}"
+        )
+
+    if not rejection_path.is_file():
+        raise FileNotFoundError(
+            "Trial-rejection path is not a file:\n"
             f"{rejection_path}"
         )
 
@@ -1022,55 +627,174 @@ def load_trial_rejection_summary(
 
     if missing_columns:
         raise ValueError(
-            "Trial-rejection table is missing "
-            f"columns: {missing_columns}"
+            f"{rejection_path} is missing required columns: "
+            f"{missing_columns}"
         )
 
     rejection = rejection.copy()
 
+    rejection["condition"] = (
+        rejection[
+            "condition"
+        ]
+        .astype(
+            "string"
+        )
+        .str.strip()
+    )
+
+    missing_condition = (
+        rejection[
+            "condition"
+        ].isna()
+        | rejection[
+            "condition"
+        ].eq(
+            ""
+        )
+    )
+
+    if missing_condition.any():
+        raise ValueError(
+            f"{rejection_path} contains missing or empty "
+            "condition labels."
+        )
+
     if "#" in rejection.columns:
-        rejection["condition_index"] = pd.to_numeric(
-            rejection["#"],
+        rejection[
+            "condition_index"
+        ] = pd.to_numeric(
+            rejection[
+                "#"
+            ],
             errors="raise",
-        ).astype(int)
+        ).astype(
+            int
+        )
     else:
-        rejection["condition_index"] = range(
+        rejection[
+            "condition_index"
+        ] = range(
             1,
-            len(rejection) + 1,
+            len(
+                rejection
+            ) + 1,
+        )
+
+    for column in [
+        "before_trial_rejection",
+        "after_trial_rejection",
+    ]:
+        rejection[
+            column
+        ] = pd.to_numeric(
+            rejection[
+                column
+            ],
+            errors="raise",
+        ).astype(
+            int
+        )
+
+        if (
+            rejection[
+                column
+            ] < 0
+        ).any():
+            raise ValueError(
+                f"{rejection_path} contains negative values "
+                f"in {column}."
+            )
+
+    impossible_counts = (
+        rejection[
+            "after_trial_rejection"
+        ]
+        > rejection[
+            "before_trial_rejection"
+        ]
+    )
+
+    if impossible_counts.any():
+        examples = (
+            rejection.loc[
+                impossible_counts,
+                [
+                    "condition",
+                    "before_trial_rejection",
+                    "after_trial_rejection",
+                ],
+            ]
+            .head(
+                10
+            )
+            .to_dict(
+                "records"
+            )
+        )
+
+        raise ValueError(
+            "Some after_trial_rejection counts are larger than "
+            "their before_trial_rejection counts. "
+            f"Examples: {examples}"
         )
 
     rejection[
-        "after_trial_rejection"
-    ] = pd.to_numeric(
-        rejection[
-            "after_trial_rejection"
-        ],
-        errors="raise",
-    ).astype(int)
+        "analysis"
+    ] = get_analysis_name(
+        mat_path
+    )
+
+    rejection[
+        "trial_rejection_file"
+    ] = str(
+        rejection_path
+    )
 
     return rejection
+
 
 def export_long_for_file(
     mat_path: Path,
     output_dir: Path,
-    bids_root: Path,
-    stimulus_lookup: pd.DataFrame,
 ):
     """
-    Export one subject's CP ERP derivative to long-format TSV.
+    Export one ERP MAT file using its exact paired
+    *_trialrej.tsv summary.
 
-    For every retained ERP trial, this function:
+    The trial-rejection TSV contains condition labels and
+    before/after trial counts.
 
-    1. Reads the retained trial's EEGLAB eventurevent reference.
-    2. Converts the corresponding urevent latency to seconds.
-    3. Matches that latency to the target-word onset in events.tsv.
-    4. Gets stim_file from events.tsv.
-    5. Gets stim_key from the language-output stimulus lookup.
-    6. Exports trial-level EEG data with channel metadata.
-    7. Saves a retained-trial lookup for later model construction.
+    It does not contain stim_file or stim_key. Therefore this
+    exporter does not invent stimulus identities or attempt to
+    use nonexistent events.tsv files.
+
+    The exporter preserves:
+
+        subject
+        ERP analysis
+        condition number
+        condition label
+        retained-trial order
+        urevent index
+        channel
+        time
+        amplitude
     """
 
     subject = get_subject_id(
+        mat_path
+    )
+
+    analysis = get_analysis_name(
+        mat_path
+    )
+
+    rejection_summary = load_trial_rejection_summary(
+        mat_path
+    )
+
+    rejection_path = get_trial_rejection_path(
         mat_path
     )
 
@@ -1078,67 +802,44 @@ def export_long_for_file(
         f"\nProcessing {mat_path.name}"
     )
 
-    events = load_subject_events(
-        bids_root=bids_root,
-        subject=subject,
-        stimulus_lookup=stimulus_lookup,
-    )
-
-    rejection_summary = load_trial_rejection_summary(
-        mat_path
+    print(
+        f"  Using {rejection_path.name}"
     )
 
     with h5py.File(
         mat_path,
         "r",
     ) as file:
-
         if "ERPs" not in file:
             raise KeyError(
-                "No ERPs dataset found."
+                "No ERPs dataset found in MAT file."
             )
 
-        if "fs" not in file:
-            raise KeyError(
-                "No sampling-frequency dataset 'fs' found."
-            )
-
-        erps = file["ERPs"]
-
-        sampling_frequency = float(
-            np.asarray(
-                file["fs"]
-            ).squeeze()
-        )
-
-        if (
-            not np.isfinite(
-                sampling_frequency
-            )
-            or sampling_frequency <= 0
-        ):
-            raise ValueError(
-                "Invalid sampling frequency found in ERP MAT file: "
-                f"{sampling_frequency}"
-            )
+        erps = file[
+            "ERPs"
+        ]
 
         times = extract_times(
             file
         )
 
-        n_conditions = erps.shape[1]
-
-        if len(rejection_summary) != n_conditions:
+        if erps.ndim != 2:
             raise ValueError(
-                "Number of rows in the trial-rejection table "
-                "does not match the number of ERP conditions: "
-                f"{len(rejection_summary)} versus {n_conditions}"
+                "ERPs dataset has an unexpected shape: "
+                f"{erps.shape}"
             )
 
-        tolerance_seconds = (
-            2.0
-            / sampling_frequency
-        )
+        n_conditions = erps.shape[1]
+
+        if len(
+            rejection_summary
+        ) != n_conditions:
+            raise ValueError(
+                "Trial-rejection row count does not match "
+                "the number of ERP conditions: "
+                f"{len(rejection_summary)} versus "
+                f"{n_conditions}"
+            )
 
         all_rows = []
         all_trial_lookups = []
@@ -1147,7 +848,8 @@ def export_long_for_file(
             n_conditions
         ):
             condition_number = (
-                condition_index + 1
+                condition_index
+                + 1
             )
 
             rejection_row = rejection_summary.iloc[
@@ -1160,6 +862,12 @@ def export_long_for_file(
                 ]
             ).strip()
 
+            before_trials = int(
+                rejection_row[
+                    "before_trial_rejection"
+                ]
+            )
+
             expected_retained_trials = int(
                 rejection_row[
                     "after_trial_rejection"
@@ -1167,9 +875,9 @@ def export_long_for_file(
             )
 
             condition_group = extract_condition_object(
-                file,
-                erps,
-                condition_index,
+                file=file,
+                erps_dataset=erps,
+                condition_index=condition_index,
             )
 
             (
@@ -1185,15 +893,17 @@ def export_long_for_file(
                 raise ValueError(
                     f"Condition {condition_number} "
                     f"({condition_label}) contains "
-                    f"{n_trials} trials in the MAT file, "
-                    "but the paired trial-rejection table reports "
-                    f"{expected_retained_trials} retained trials."
+                    f"{n_trials} retained trials in the MAT file, "
+                    f"but {rejection_path.name} reports "
+                    f"{expected_retained_trials}."
                 )
 
-            if len(times) != n_timepoints:
+            if len(
+                times
+            ) != n_timepoints:
                 raise ValueError(
-                    "Time vector length does not match the ERP "
-                    f"time dimension for condition {condition_number}: "
+                    "Time-vector length does not match ERP "
+                    f"timepoints for condition {condition_number}: "
                     f"{len(times)} versus {n_timepoints}"
                 )
 
@@ -1203,68 +913,102 @@ def export_long_for_file(
                 n_trials=n_trials,
             )
 
-            trial_lookup = match_retained_trials_to_events(
-                urevent_indices=urevent_indices,
-                file=file,
-                condition_group=condition_group,
-                events=events,
-                sampling_frequency=sampling_frequency,
-                tolerance_seconds=tolerance_seconds,
-            )
-
-            if len(trial_lookup) != n_trials:
+            if len(
+                urevent_indices
+            ) != n_trials:
                 raise ValueError(
-                    f"Condition {condition_number} produced "
-                    f"{len(trial_lookup)} trial matches for "
-                    f"{n_trials} retained ERP trials."
+                    "Number of extracted urevent indices does not "
+                    f"match retained trials: {len(urevent_indices)} "
+                    f"versus {n_trials}"
                 )
 
-            trial_lookup.insert(
-                0,
-                "subject",
-                subject,
+            trial_lookup = pd.DataFrame(
+                {
+                    "subject": subject,
+                    "analysis": analysis,
+                    "condition": condition_number,
+                    "condition_label": condition_label,
+                    "before_trial_rejection": before_trials,
+                    "after_trial_rejection": expected_retained_trials,
+                    "retained_trial": np.arange(
+                        1,
+                        n_trials + 1,
+                        dtype=int,
+                    ),
+                    "urevent_index": urevent_indices,
+                }
             )
 
-            trial_lookup.insert(
-                1,
-                "condition",
-                condition_number,
+            trial_lookup[
+                "epoch_id"
+            ] = (
+                trial_lookup[
+                    "subject"
+                ].astype(
+                    str
+                )
+                + "_"
+                + trial_lookup[
+                    "analysis"
+                ].astype(
+                    str
+                )
+                + "_c"
+                + trial_lookup[
+                    "condition"
+                ].astype(
+                    str
+                )
+                + "_r"
+                + trial_lookup[
+                    "retained_trial"
+                ].astype(
+                    str
+                )
             )
 
-            trial_lookup.insert(
-                2,
-                "condition_label",
-                condition_label,
+            duplicated_epochs = trial_lookup.duplicated(
+                subset=[
+                    "epoch_id",
+                ],
+                keep=False,
             )
+
+            if duplicated_epochs.any():
+                raise ValueError(
+                    "Duplicate epoch_id values were created for "
+                    f"{mat_path.name}, condition {condition_number}."
+                )
 
             all_trial_lookups.append(
                 trial_lookup
             )
 
             channel_labels = extract_channel_labels(
-                file,
-                condition_group,
-                n_channels,
+                file=file,
+                condition_group=condition_group,
+                n_channels=n_channels,
             )
 
             channel_metadata = build_channel_metadata(
-                bids_root=bids_root,
-                subject=subject,
-                channel_labels=channel_labels,
+                channel_labels
             )
 
-            if len(channel_metadata) != n_channels:
+            if len(
+                channel_metadata
+            ) != n_channels:
                 raise ValueError(
-                    "Channel metadata count does not match the "
-                    f"ERP channel count: {len(channel_metadata)} "
+                    "Channel metadata count does not match ERP "
+                    f"channel count: {len(channel_metadata)} "
                     f"versus {n_channels}"
                 )
 
             print(
                 f"  Condition {condition_number}: "
                 f"{condition_label} - "
-                f"{n_trials} retained trials x "
-                f"{n_timepoints} timepoints x "
+                f"{before_trials} before rejection, "
+                f"{n_trials} retained, "
+                f"{n_timepoints} timepoints, "
                 f"{n_channels} channels"
             )
 
@@ -1281,14 +1025,18 @@ def export_long_for_file(
                     :,
                 ]
 
-                if trial_data.shape != (
+                expected_shape = (
                     n_timepoints,
                     n_channels,
-                ):
+                )
+
+                if trial_data.shape != expected_shape:
                     raise ValueError(
-                        "Unexpected retained-trial data shape for "
-                        f"condition {condition_number}, trial "
-                        f"{trial_index + 1}: {trial_data.shape}"
+                        "Unexpected trial shape "
+                        f"{trial_data.shape} for condition "
+                        f"{condition_number}, retained trial "
+                        f"{trial_index + 1}. Expected "
+                        f"{expected_shape}."
                     )
 
                 for channel_index in range(
@@ -1303,11 +1051,29 @@ def export_long_for_file(
                         channel_index,
                     ]
 
+                    if len(
+                        amplitudes
+                    ) != len(
+                        times
+                    ):
+                        raise ValueError(
+                            "Amplitude count does not match the "
+                            "time-vector length for condition "
+                            f"{condition_number}, retained trial "
+                            f"{trial_index + 1}, channel "
+                            f"{channel_index + 1}."
+                        )
+
                     rows = pd.DataFrame(
                         {
                             "subject": subject,
+                            "analysis": analysis,
                             "condition": condition_number,
                             "condition_label": condition_label,
+                            "before_trial_rejection": before_trials,
+                            "after_trial_rejection": (
+                                expected_retained_trials
+                            ),
                             "trial": trial_index + 1,
                             "retained_trial": int(
                                 lookup_row[
@@ -1319,42 +1085,8 @@ def export_long_for_file(
                                     "urevent_index"
                                 ]
                             ),
-                            "urevent_seconds": float(
-                                lookup_row[
-                                    "urevent_seconds"
-                                ]
-                            ),
-                            "event_time_difference_seconds": float(
-                                lookup_row[
-                                    "event_time_difference_seconds"
-                                ]
-                            ),
-                            "original_event_row": int(
-                                lookup_row[
-                                    "original_event_row"
-                                ]
-                            ),
-                            "experimental_trial": int(
-                                lookup_row[
-                                    "experimental_trial"
-                                ]
-                            ),
-                            "trial_type": lookup_row[
-                                "trial_type"
-                            ],
-                            "target_onset_seconds": float(
-                                lookup_row[
-                                    "target_onset_seconds"
-                                ]
-                            ),
-                            "stim_file": lookup_row[
-                                "stim_file"
-                            ],
-                            "stim_key": lookup_row[
-                                "stim_key"
-                            ],
-                            "item": lookup_row[
-                                "stim_key"
+                            "epoch_id": lookup_row[
+                                "epoch_id"
                             ],
                             "channel": metadata[
                                 "channel"
@@ -1405,9 +1137,11 @@ def export_long_for_file(
                                 "status",
                                 np.nan,
                             ),
-                            "channel_status_description": metadata.get(
-                                "status_description",
-                                np.nan,
+                            "channel_status_description": (
+                                metadata.get(
+                                    "status_description",
+                                    np.nan,
+                                )
                             ),
                             "time": times,
                             "amplitude": amplitudes,
@@ -1420,129 +1154,88 @@ def export_long_for_file(
 
         if not all_rows:
             raise ValueError(
-                f"No ERP rows were extracted for {subject}."
+                "No ERP rows were extracted from "
+                f"{mat_path.name}."
             )
 
         if not all_trial_lookups:
             raise ValueError(
-                f"No retained-trial lookups were created for {subject}."
+                "No retained-trial lookup rows were created for "
+                f"{mat_path.name}."
             )
+
+        output_table = pd.concat(
+            all_rows,
+            ignore_index=True,
+        )
 
         trial_lookup_all = pd.concat(
             all_trial_lookups,
             ignore_index=True,
         )
 
-        duplicated_retained_trials = (
-            trial_lookup_all
-            .duplicated(
-                subset=[
-                    "condition",
-                    "retained_trial",
-                ],
-                keep=False,
-            )
+        duplicated_lookup_rows = trial_lookup_all.duplicated(
+            subset=[
+                "subject",
+                "analysis",
+                "condition",
+                "retained_trial",
+            ],
+            keep=False,
         )
 
-        if duplicated_retained_trials.any():
+        if duplicated_lookup_rows.any():
             examples = (
                 trial_lookup_all.loc[
-                    duplicated_retained_trials,
+                    duplicated_lookup_rows,
                     [
+                        "subject",
+                        "analysis",
                         "condition",
                         "retained_trial",
                     ],
                 ]
-                .head(10)
+                .head(
+                    10
+                )
                 .to_dict(
                     "records"
                 )
             )
 
             raise ValueError(
-                "Duplicate condition/retained-trial mappings "
-                f"were found. Examples: {examples}"
-            )
-
-        duplicated_event_matches = (
-            trial_lookup_all
-            .duplicated(
-                subset=[
-                    "original_event_row",
-                ],
-                keep=False,
-            )
-        )
-
-        if duplicated_event_matches.any():
-            examples = (
-                trial_lookup_all.loc[
-                    duplicated_event_matches,
-                    [
-                        "condition",
-                        "retained_trial",
-                        "original_event_row",
-                        "stim_key",
-                    ],
-                ]
-                .head(10)
-                .to_dict(
-                    "records"
-                )
-            )
-
-            raise ValueError(
-                "The same original events.tsv row was matched "
-                "to more than one retained ERP trial. "
+                "Duplicate retained-trial lookup rows were found. "
                 f"Examples: {examples}"
             )
-
-        missing_stim_keys = (
-            trial_lookup_all["stim_key"].isna()
-            | trial_lookup_all[
-                "stim_key"
-            ].astype("string").str.strip().eq("")
-        )
-
-        if missing_stim_keys.any():
-            raise ValueError(
-                f"{subject} contains retained trials with "
-                "missing stim_key values."
-            )
-
-        maximum_time_difference = float(
-            trial_lookup_all[
-                "event_time_difference_seconds"
-            ].max()
-        )
-
-        print(
-            "  Maximum ERP-to-target-onset difference: "
-            f"{maximum_time_difference:.6f} seconds"
-        )
-
-        out = pd.concat(
-            all_rows,
-            ignore_index=True,
-        )
 
     output_dir.mkdir(
         parents=True,
         exist_ok=True,
     )
 
-    out_path = (
+    safe_analysis = analysis.replace(
+        "/",
+        "_",
+    )
+
+    output_path = (
         output_dir
-        / f"{subject}_erp_long.tsv"
+        / (
+            f"{subject}_erp-"
+            f"{safe_analysis}_long.tsv"
+        )
     )
 
     lookup_path = (
         output_dir
-        / f"{subject}_trial_lookup.tsv"
+        / (
+            f"{subject}_erp-"
+            f"{safe_analysis}_trial_lookup.tsv"
+        )
     )
 
-    out.to_csv(
-        out_path,
+    output_table.to_csv(
+        output_path,
         sep="\t",
         index=False,
     )
@@ -1554,48 +1247,164 @@ def export_long_for_file(
     )
 
     print(
-        f"Saved ERP long file: {out_path}"
+        f"Saved ERP long file: {output_path}"
     )
 
     print(
         f"Saved retained-trial lookup: {lookup_path}"
     )
 
-    return out_path
+    return output_path
+
+
+def discover_erp_mat_files(
+    erp_root: Path,
+    analyses: list[str],
+) -> list[Path]:
+    """
+    Find ERP MAT files for the requested analyses under the
+    subject subfolders.
+
+    Expected structure:
+
+        erp_root/
+            sub-01/
+                sub-01_task-N400Stimset_erp-CP.mat
+                sub-01_task-N400Stimset_erp-CP_trialrej.tsv
+            sub-02/
+                ...
+    """
+
+    mat_files = []
+
+    for analysis in analyses:
+        pattern = (
+            f"sub-*/*_erp-{analysis}.mat"
+        )
+
+        mat_files.extend(
+            erp_root.glob(
+                pattern
+            )
+        )
+
+    return sorted(
+        set(
+            mat_files
+        )
+    )
+
+
+def parse_analysis_list(
+    value: str,
+) -> list[str]:
+    """
+    Parse the --analyses argument.
+
+    Valid values:
+
+        CP
+        GA
+        LD
+        Order
+        Time
+        ALL
+
+    Multiple analyses may be comma-separated.
+    """
+
+    valid_analyses = [
+        "CP",
+        "GA",
+        "LD",
+        "Order",
+        "Time",
+    ]
+
+    cleaned_value = str(
+        value
+    ).strip()
+
+    if cleaned_value.upper() == "ALL":
+        return valid_analyses
+
+    requested_analyses = [
+        item.strip()
+        for item in cleaned_value.split(
+            ","
+        )
+        if item.strip()
+    ]
+
+    if not requested_analyses:
+        raise ValueError(
+            "No ERP analyses were requested."
+        )
+
+    normalised_lookup = {
+        analysis.lower(): analysis
+        for analysis in valid_analyses
+    }
+
+    normalised_analyses = []
+    invalid_analyses = []
+
+    for requested_analysis in requested_analyses:
+        matched_analysis = normalised_lookup.get(
+            requested_analysis.lower()
+        )
+
+        if matched_analysis is None:
+            invalid_analyses.append(
+                requested_analysis
+            )
+        else:
+            normalised_analyses.append(
+                matched_analysis
+            )
+
+    if invalid_analyses:
+        raise ValueError(
+            f"Unknown ERP analyses: {invalid_analyses}. "
+            f"Valid values are {valid_analyses} or ALL."
+        )
+
+    return list(
+        dict.fromkeys(
+            normalised_analyses
+        )
+    )
+
 
 def main():
+    """
+    Command-line entry point.
+    """
+
     parser = argparse.ArgumentParser(
         description=(
-            "Export CP ERP MAT files to long-format EEG TSV "
-            "and attach stimulus identifiers from the language outputs."
+            "Export N400Stimset ERP MAT files to long-format "
+            "TSV using the exact matching "
+            "*_erp-<analysis>_trialrej.tsv file in each "
+            "subject folder."
         )
     )
 
     parser.add_argument(
         "erp_root",
         help=(
-            "Path to the ERP derivatives folder containing "
-            "sub-*/*_erp-CP.mat and matching "
-            "*_erp-CP_trialrej.tsv files."
+            "ERP root folder containing sub-* subject "
+            "subfolders."
         ),
     )
 
     parser.add_argument(
-        "--bids-root",
-        required=True,
+        "--analyses",
+        default="CP",
         help=(
-            "Path containing subject event files such as "
-            "sub-XX/eeg/sub-XX_task-N400Stimset_events.tsv. "
-            "This path is used only for the participant events tables."
-        ),
-    )
-
-    parser.add_argument(
-        "--language-metrics",
-        required=True,
-        help=(
-            "Path to language_outputs/ALL_language_metrics.tsv. "
-            "This table must contain stim_file and stim_key."
+            "Comma-separated ERP analyses: "
+            "CP,GA,LD,Order,Time, or ALL. "
+            "Default: CP."
         ),
     )
 
@@ -1603,8 +1412,8 @@ def main():
         "--output-dir",
         default="eeg_outputs",
         help=(
-            "Directory where participant and combined EEG TSV "
-            "files will be saved."
+            "Directory where participant and combined ERP "
+            "TSV files will be saved."
         ),
     )
 
@@ -1614,17 +1423,13 @@ def main():
         args.erp_root
     ).expanduser().resolve()
 
-    bids_root = Path(
-        args.bids_root
-    ).expanduser().resolve()
-
-    language_metrics_path = Path(
-        args.language_metrics
-    ).expanduser().resolve()
-
     output_dir = Path(
         args.output_dir
     ).expanduser().resolve()
+
+    analyses = parse_analysis_list(
+        args.analyses
+    )
 
     if not erp_root.exists():
         raise FileNotFoundError(
@@ -1633,124 +1438,59 @@ def main():
 
     if not erp_root.is_dir():
         raise NotADirectoryError(
-            f"ERP root is not a directory: {erp_root}"
+            "ERP root is not a directory: "
+            f"{erp_root}"
         )
 
-    if not bids_root.exists():
-        raise FileNotFoundError(
-            f"Events root not found: {bids_root}"
-        )
-
-    if not bids_root.is_dir():
-        raise NotADirectoryError(
-            f"Events root is not a directory: {bids_root}"
-        )
-
-    if not language_metrics_path.exists():
-        raise FileNotFoundError(
-            "Language metrics file not found:\n"
-            f"{language_metrics_path}"
-        )
-
-    if not language_metrics_path.is_file():
-        raise FileNotFoundError(
-            "Language metrics path is not a file:\n"
-            f"{language_metrics_path}"
-        )
-
-    stimulus_lookup = load_stimulus_lookup(
-        language_metrics_path
-    )
-
-    mat_files = sorted(
-        erp_root.glob(
-            "sub-*/*_erp-CP.mat"
-        )
+    mat_files = discover_erp_mat_files(
+        erp_root=erp_root,
+        analyses=analyses,
     )
 
     if not mat_files:
-        raise FileNotFoundError(
-            "No CP ERP MAT files were found.\n"
-            f"Searched: {erp_root}/sub-*/*_erp-CP.mat"
-        )
-
-    missing_rejection_files = []
-
-    for mat_path in mat_files:
-        rejection_path = mat_path.with_name(
-            mat_path.stem
-            + "_trialrej.tsv"
-        )
-
-        if not rejection_path.exists():
-            missing_rejection_files.append(
-                rejection_path
+        searched_patterns = "\n".join(
+            str(
+                erp_root
+                / "sub-*"
+                / f"*_erp-{analysis}.mat"
             )
+            for analysis in analyses
+        )
+
+        raise FileNotFoundError(
+            "No matching ERP MAT files were found. "
+            "Searched:\n"
+            f"{searched_patterns}"
+        )
+
+    missing_rejection_files = [
+        get_trial_rejection_path(
+            mat_path
+        )
+        for mat_path in mat_files
+        if not get_trial_rejection_path(
+            mat_path
+        ).exists()
+    ]
 
     if missing_rejection_files:
         examples = "\n".join(
-            str(path)
-            for path in missing_rejection_files[:10]
+            str(
+                path
+            )
+            for path in missing_rejection_files[
+                :20
+            ]
         )
 
         raise FileNotFoundError(
-            "Some ERP MAT files do not have matching "
-            "_trialrej.tsv files.\n"
-            f"{examples}"
-        )
-
-    subjects = sorted(
-        {
-            get_subject_id(
-                mat_path
-            )
-            for mat_path in mat_files
-        }
-    )
-
-    missing_events_files = []
-
-    for subject in subjects:
-        possible_paths = [
-            (
-                bids_root
-                / subject
-                / "eeg"
-                / f"{subject}_task-N400Stimset_events.tsv"
-            ),
-            (
-                bids_root
-                / subject
-                / f"{subject}_task-N400Stimset_events.tsv"
-            ),
-        ]
-
-        if not any(
-            path.exists()
-            for path in possible_paths
-        ):
-            missing_events_files.append(
-                possible_paths
-            )
-
-    if missing_events_files:
-        examples = "\n\n".join(
-            "Checked:\n"
-            + "\n".join(
-                str(path)
-                for path in paths
-            )
-            for paths in missing_events_files[:10]
-        )
-
-        raise FileNotFoundError(
-            "Subject events files required for matching retained "
-            "ERP trials were not found.\n"
+            "Some ERP MAT files do not have their exact "
+            "matching *_trialrej.tsv file:\n"
             f"{examples}"
         )
 
     print(
-        f"Found {len(mat_files)} ERP CP files."
+        f"Found {len(mat_files)} ERP MAT files."
     )
 
     print(
@@ -1758,12 +1498,10 @@ def main():
     )
 
     print(
-        f"Using events root: {bids_root}"
-    )
-
-    print(
-        "Using language stimulus table: "
-        f"{language_metrics_path}"
+        "Analyses: "
+        + ", ".join(
+            analyses
+        )
     )
 
     output_dir.mkdir(
@@ -1776,15 +1514,13 @@ def main():
 
     for mat_path in mat_files:
         try:
-            out_path = export_long_for_file(
+            output_path = export_long_for_file(
                 mat_path=mat_path,
                 output_dir=output_dir,
-                bids_root=bids_root,
-                stimulus_lookup=stimulus_lookup,
             )
 
             output_files.append(
-                out_path
+                output_path
             )
 
         except Exception as error:
@@ -1794,8 +1530,12 @@ def main():
 
             failed_files.append(
                 {
-                    "file": str(mat_path),
-                    "error": str(error),
+                    "file": str(
+                        mat_path
+                    ),
+                    "error": str(
+                        error
+                    ),
                 }
             )
 
@@ -1814,17 +1554,14 @@ def main():
         )
 
         print(
-            f"Saved failed-export report: {failed_path}"
+            "Saved failed-export report: "
+            f"{failed_path}"
         )
 
     if not output_files:
         raise RuntimeError(
-            "No participant ERP files were exported successfully."
+            "No ERP MAT files were exported successfully."
         )
-
-    print(
-        "\nCombining subject TSV files safely in chunks..."
-    )
 
     combined_path = (
         output_dir
@@ -1834,15 +1571,19 @@ def main():
     if combined_path.exists():
         combined_path.unlink()
 
+    print(
+        "\nCombining exported TSV files in chunks..."
+    )
+
     first_chunk = True
 
-    for path in output_files:
+    for output_path in output_files:
         print(
-            f"  Adding: {path.name}"
+            f"  Adding: {output_path.name}"
         )
 
         for chunk in pd.read_csv(
-            path,
+            output_path,
             sep="\t",
             chunksize=500_000,
         ):
@@ -1861,21 +1602,22 @@ def main():
             first_chunk = False
 
     print(
-        "Saved combined EEG long file: "
+        "Saved combined ERP long file: "
         f"{combined_path}"
     )
 
     print(
-        f"{len(output_files)} ERP files exported successfully."
+        f"{len(output_files)} ERP MAT files "
+        "exported successfully."
     )
 
     if failed_files:
         print(
-            f"{len(failed_files)} ERP files failed."
+            f"{len(failed_files)} ERP MAT files failed."
         )
 
     print(
-        "\nDone."
+        "Done."
     )
 
 
