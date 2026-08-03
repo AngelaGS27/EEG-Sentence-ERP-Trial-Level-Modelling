@@ -5,6 +5,7 @@ import numpy as np
 import pandas as pd
 
 
+
 def decode_matlab_string(file, ref):
     """Decode MATLAB HDF5 string reference."""
     try:
@@ -757,29 +758,19 @@ def load_trial_rejection_summary(
 def export_long_for_file(
     mat_path: Path,
     output_dir: Path,
+    selected_channels=None,
 ):
     """
     Export one ERP MAT file using its exact paired
     *_trialrej.tsv summary.
 
-    The trial-rejection TSV contains condition labels and
-    before/after trial counts.
+    This version keeps all ERP timepoints, but can restrict the
+    export to selected channels.
 
-    The exporter preserves:
+    If selected_channels is None, all channels are exported.
 
-        subject
-        ERP analysis
-        condition number
-        condition label
-        retained-trial order
-        urevent index
-        channel
-        time
-        amplitude
-
-    If the MAT file and *_trialrej.tsv disagree on the retained
-    trial count, the MAT file is treated as authoritative because
-    it contains the actual exported ERP data.
+    If selected_channels is provided, it should contain channel
+    labels such as A1, A2, Cz, Pz, CPz, etc.
     """
 
     subject = get_subject_id(
@@ -806,6 +797,20 @@ def export_long_for_file(
         f"  Using {rejection_path.name}"
     )
 
+    if selected_channels is None:
+        print(
+            "  Channel filter: ALL channels"
+        )
+    else:
+        print(
+            "  Channel filter: "
+            + ", ".join(
+                sorted(
+                    selected_channels
+                )
+            )
+        )
+
     with h5py.File(
         mat_path,
         "r",
@@ -829,7 +834,9 @@ def export_long_for_file(
                 f"{erps.shape}"
             )
 
-        n_conditions = erps.shape[1]
+        n_conditions = erps.shape[
+            1
+        ]
 
         if len(
             rejection_summary
@@ -1014,6 +1021,111 @@ def export_long_for_file(
                     f"versus {n_channels}"
                 )
 
+            if selected_channels is None:
+                selected_channel_indices = list(
+                    range(
+                        n_channels
+                    )
+                )
+
+                selected_channel_metadata = channel_metadata.copy()
+
+            else:
+                channel_match_values = pd.DataFrame(
+                    {
+                        "channel": channel_metadata[
+                            "channel"
+                        ].astype(str),
+                        "original_channel": channel_metadata[
+                            "original_channel"
+                        ].astype(str),
+                        "electrode": channel_metadata[
+                            "electrode"
+                        ].astype(str),
+                        "standard_label": channel_metadata[
+                            "standard_label"
+                        ].astype(str),
+                    }
+                )
+
+                channel_match_values = channel_match_values.apply(
+                    lambda column: column.str.strip()
+                )
+
+                wanted = {
+                    str(
+                        channel
+                    ).strip()
+                    for channel in selected_channels
+                }
+
+                channel_mask = (
+                    channel_match_values[
+                        "channel"
+                    ].isin(
+                        wanted
+                    )
+                    | channel_match_values[
+                        "original_channel"
+                    ].isin(
+                        wanted
+                    )
+                    | channel_match_values[
+                        "electrode"
+                    ].isin(
+                        wanted
+                    )
+                    | channel_match_values[
+                        "standard_label"
+                    ].isin(
+                        wanted
+                    )
+                )
+
+                selected_channel_indices = (
+                    channel_metadata.index[
+                        channel_mask
+                    ]
+                    .astype(
+                        int
+                    )
+                    .tolist()
+                )
+
+                if not selected_channel_indices:
+                    available_channels = (
+                        channel_metadata[
+                            [
+                                "channel",
+                                "original_channel",
+                                "electrode",
+                                "standard_label",
+                            ]
+                        ]
+                        .head(
+                            30
+                        )
+                        .to_dict(
+                            "records"
+                        )
+                    )
+
+                    raise ValueError(
+                        "None of the requested channels were found "
+                        f"in {mat_path.name}. Requested: "
+                        f"{sorted(wanted)}. First available labels: "
+                        f"{available_channels}"
+                    )
+
+                selected_channel_metadata = (
+                    channel_metadata.loc[
+                        selected_channel_indices
+                    ]
+                    .reset_index(
+                        drop=True
+                    )
+                )
+
             print(
                 f"  Condition {condition_number}: "
                 f"{condition_label} - "
@@ -1021,7 +1133,8 @@ def export_long_for_file(
                 f"{reported_retained_trials} reported retained, "
                 f"{mat_retained_trials} MAT retained, "
                 f"{n_timepoints} timepoints, "
-                f"{n_channels} channels"
+                f"{len(selected_channel_indices)} of "
+                f"{n_channels} channels exported"
             )
 
             for trial_index in range(
@@ -1051,11 +1164,11 @@ def export_long_for_file(
                         f"{expected_shape}."
                     )
 
-                for channel_index in range(
-                    n_channels
+                for metadata_position, channel_index in enumerate(
+                    selected_channel_indices
                 ):
-                    metadata = channel_metadata.iloc[
-                        channel_index
+                    metadata = selected_channel_metadata.iloc[
+                        metadata_position
                     ]
 
                     amplitudes = trial_data[
@@ -1277,29 +1390,37 @@ def discover_erp_mat_files(
     analyses: list[str],
 ) -> list[Path]:
     """
-    Find ERP MAT files for the requested analyses under the
-    subject subfolders.
+    Find ERP MAT files for the requested analyses.
 
-    Expected structure:
+    Supports both:
 
-        erp_root/
-            sub-01/
-                sub-01_task-N400Stimset_erp-CP.mat
-                sub-01_task-N400Stimset_erp-CP_trialrej.tsv
-            sub-02/
-                ...
+        erp_root/sub-01/sub-01_task-N400Stimset_erp-CP.mat
+
+    and:
+
+        erp_root/sub-01_task-N400Stimset_erp-CP.mat
     """
 
     mat_files = []
 
     for analysis in analyses:
-        pattern = (
+        nested_pattern = (
             f"sub-*/*_erp-{analysis}.mat"
+        )
+
+        direct_pattern = (
+            f"*_erp-{analysis}.mat"
         )
 
         mat_files.extend(
             erp_root.glob(
-                pattern
+                nested_pattern
+            )
+        )
+
+        mat_files.extend(
+            erp_root.glob(
+                direct_pattern
             )
         )
 
@@ -1390,11 +1511,40 @@ def parse_analysis_list(
         )
     )
 
+def parse_channel_list(
+    value: str,
+):
+    """
+    Parse --channels.
+
+    Use ALL to export every channel.
+
+    """
+
+    cleaned_value = str(
+        value
+    ).strip()
+
+    if cleaned_value.upper() == "ALL":
+        return None
+
+    channels = {
+        item.strip()
+        for item in cleaned_value.split(
+            ","
+        )
+        if item.strip()
+    }
+
+    if not channels:
+        raise ValueError(
+            "No channels were requested. Use --channels ALL "
+            "or a comma-separated list."
+        )
+
+    return channels
 
 def main():
-    """
-    Command-line entry point.
-    """
 
     parser = argparse.ArgumentParser(
         description=(
@@ -1432,6 +1582,17 @@ def main():
         ),
     )
 
+    parser.add_argument(
+        "--channels",
+        default="ALL",
+        help=(
+            "Channels to export. Use ALL for every channel, "
+            "or a comma-separated list such as "
+            "A19,A20,A21,A22,A23,A24,A25,A26. "
+            "Default: ALL."
+        ),
+    )
+
     args = parser.parse_args()
 
     erp_root = Path(
@@ -1444,6 +1605,10 @@ def main():
 
     analyses = parse_analysis_list(
         args.analyses
+    )
+
+    selected_channels = parse_channel_list(
+        args.channels
     )
 
     if not erp_root.exists():
@@ -1519,6 +1684,20 @@ def main():
         )
     )
 
+    if selected_channels is None:
+        print(
+            "Channels: ALL"
+        )
+    else:
+        print(
+            "Channels: "
+            + ", ".join(
+                sorted(
+                    selected_channels
+                )
+            )
+        )
+
     output_dir.mkdir(
         parents=True,
         exist_ok=True,
@@ -1532,6 +1711,7 @@ def main():
             output_path = export_long_for_file(
                 mat_path=mat_path,
                 output_dir=output_dir,
+                selected_channels=selected_channels,
             )
 
             output_files.append(
