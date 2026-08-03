@@ -765,10 +765,6 @@ def export_long_for_file(
     The trial-rejection TSV contains condition labels and
     before/after trial counts.
 
-    It does not contain stim_file or stim_key. Therefore this
-    exporter does not invent stimulus identities or attempt to
-    use nonexistent events.tsv files.
-
     The exporter preserves:
 
         subject
@@ -780,6 +776,10 @@ def export_long_for_file(
         channel
         time
         amplitude
+
+    If the MAT file and *_trialrej.tsv disagree on the retained
+    trial count, the MAT file is treated as authoritative because
+    it contains the actual exported ERP data.
     """
 
     subject = get_subject_id(
@@ -868,7 +868,7 @@ def export_long_for_file(
                 ]
             )
 
-            expected_retained_trials = int(
+            reported_retained_trials = int(
                 rejection_row[
                     "after_trial_rejection"
                 ]
@@ -889,13 +889,19 @@ def export_long_for_file(
                 condition_group
             )
 
-            if n_trials != expected_retained_trials:
-                raise ValueError(
-                    f"Condition {condition_number} "
-                    f"({condition_label}) contains "
-                    f"{n_trials} retained trials in the MAT file, "
-                    f"but {rejection_path.name} reports "
-                    f"{expected_retained_trials}."
+            mat_retained_trials = int(
+                n_trials
+            )
+
+            if mat_retained_trials != reported_retained_trials:
+                print(
+                    "  WARNING: retained-trial count mismatch for "
+                    f"condition {condition_number} "
+                    f"({condition_label}). "
+                    f"MAT file contains {mat_retained_trials}; "
+                    f"{rejection_path.name} reports "
+                    f"{reported_retained_trials}. "
+                    "Using MAT-file count."
                 )
 
             if len(
@@ -910,16 +916,16 @@ def export_long_for_file(
             urevent_indices = extract_epoch_urevent_indices(
                 file=file,
                 condition_group=condition_group,
-                n_trials=n_trials,
+                n_trials=mat_retained_trials,
             )
 
             if len(
                 urevent_indices
-            ) != n_trials:
+            ) != mat_retained_trials:
                 raise ValueError(
                     "Number of extracted urevent indices does not "
                     f"match retained trials: {len(urevent_indices)} "
-                    f"versus {n_trials}"
+                    f"versus {mat_retained_trials}"
                 )
 
             trial_lookup = pd.DataFrame(
@@ -929,10 +935,15 @@ def export_long_for_file(
                     "condition": condition_number,
                     "condition_label": condition_label,
                     "before_trial_rejection": before_trials,
-                    "after_trial_rejection": expected_retained_trials,
+                    "after_trial_rejection_reported": (
+                        reported_retained_trials
+                    ),
+                    "after_trial_rejection_mat": (
+                        mat_retained_trials
+                    ),
                     "retained_trial": np.arange(
                         1,
-                        n_trials + 1,
+                        mat_retained_trials + 1,
                         dtype=int,
                     ),
                     "urevent_index": urevent_indices,
@@ -1007,13 +1018,14 @@ def export_long_for_file(
                 f"  Condition {condition_number}: "
                 f"{condition_label} - "
                 f"{before_trials} before rejection, "
-                f"{n_trials} retained, "
+                f"{reported_retained_trials} reported retained, "
+                f"{mat_retained_trials} MAT retained, "
                 f"{n_timepoints} timepoints, "
                 f"{n_channels} channels"
             )
 
             for trial_index in range(
-                n_trials
+                mat_retained_trials
             ):
                 lookup_row = trial_lookup.iloc[
                     trial_index
@@ -1071,8 +1083,11 @@ def export_long_for_file(
                             "condition": condition_number,
                             "condition_label": condition_label,
                             "before_trial_rejection": before_trials,
-                            "after_trial_rejection": (
-                                expected_retained_trials
+                            "after_trial_rejection_reported": (
+                                reported_retained_trials
+                            ),
+                            "after_trial_rejection_mat": (
+                                mat_retained_trials
                             ),
                             "trial": trial_index + 1,
                             "retained_trial": int(
