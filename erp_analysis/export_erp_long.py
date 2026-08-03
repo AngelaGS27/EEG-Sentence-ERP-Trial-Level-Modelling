@@ -764,13 +764,10 @@ def export_long_for_file(
     Export one ERP MAT file using its exact paired
     *_trialrej.tsv summary.
 
-    This version keeps all ERP timepoints, but can restrict the
-    export to selected channels.
+    This version streams rows directly to disk instead of
+    storing the full long-format ERP table in memory.
 
     If selected_channels is None, all channels are exported.
-
-    If selected_channels is provided, it should contain channel
-    labels such as A1, A2, Cz, Pz, CPz, etc.
     """
 
     subject = get_subject_id(
@@ -811,6 +808,42 @@ def export_long_for_file(
             )
         )
 
+    output_dir.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    safe_analysis = analysis.replace(
+        "/",
+        "_",
+    )
+
+    output_path = (
+        output_dir
+        / (
+            f"{subject}_erp-"
+            f"{safe_analysis}_long.tsv"
+        )
+    )
+
+    lookup_path = (
+        output_dir
+        / (
+            f"{subject}_erp-"
+            f"{safe_analysis}_trial_lookup.tsv"
+        )
+    )
+
+    if output_path.exists():
+        output_path.unlink()
+
+    if lookup_path.exists():
+        lookup_path.unlink()
+
+    first_output_chunk = True
+    all_trial_lookups = []
+    wrote_any_rows = False
+
     with h5py.File(
         mat_path,
         "r",
@@ -847,9 +880,6 @@ def export_long_for_file(
                 f"{len(rejection_summary)} versus "
                 f"{n_conditions}"
             )
-
-        all_rows = []
-        all_trial_lookups = []
 
         for condition_index in range(
             n_conditions
@@ -1137,6 +1167,23 @@ def export_long_for_file(
                 f"{n_channels} channels exported"
             )
 
+            n_selected_channels = len(
+                selected_channel_indices
+            )
+
+            repeated_times = np.tile(
+                times,
+                n_selected_channels,
+            )
+
+            repeated_channel_metadata = selected_channel_metadata.loc[
+                selected_channel_metadata.index.repeat(
+                    n_timepoints
+                )
+            ].reset_index(
+                drop=True
+            )
+
             for trial_index in range(
                 mat_retained_trials
             ):
@@ -1164,123 +1211,119 @@ def export_long_for_file(
                         f"{expected_shape}."
                     )
 
-                for metadata_position, channel_index in enumerate(
-                    selected_channel_indices
+                selected_trial_data = trial_data[
+                    :,
+                    selected_channel_indices,
+                ]
+
+                amplitudes = selected_trial_data.T.reshape(
+                    -1
+                )
+
+                if len(
+                    amplitudes
+                ) != len(
+                    repeated_times
                 ):
-                    metadata = selected_channel_metadata.iloc[
-                        metadata_position
-                    ]
-
-                    amplitudes = trial_data[
-                        :,
-                        channel_index,
-                    ]
-
-                    if len(
-                        amplitudes
-                    ) != len(
-                        times
-                    ):
-                        raise ValueError(
-                            "Amplitude count does not match the "
-                            "time-vector length for condition "
-                            f"{condition_number}, retained trial "
-                            f"{trial_index + 1}, channel "
-                            f"{channel_index + 1}."
-                        )
-
-                    rows = pd.DataFrame(
-                        {
-                            "subject": subject,
-                            "analysis": analysis,
-                            "condition": condition_number,
-                            "condition_label": condition_label,
-                            "before_trial_rejection": before_trials,
-                            "after_trial_rejection_reported": (
-                                reported_retained_trials
-                            ),
-                            "after_trial_rejection_mat": (
-                                mat_retained_trials
-                            ),
-                            "trial": trial_index + 1,
-                            "retained_trial": int(
-                                lookup_row[
-                                    "retained_trial"
-                                ]
-                            ),
-                            "urevent_index": int(
-                                lookup_row[
-                                    "urevent_index"
-                                ]
-                            ),
-                            "epoch_id": lookup_row[
-                                "epoch_id"
-                            ],
-                            "channel": metadata[
-                                "channel"
-                            ],
-                            "original_channel": metadata[
-                                "original_channel"
-                            ],
-                            "electrode": metadata[
-                                "electrode"
-                            ],
-                            "standard_label": metadata.get(
-                                "standard_label",
-                                "",
-                            ),
-                            "x": metadata.get(
-                                "x",
-                                np.nan,
-                            ),
-                            "y": metadata.get(
-                                "y",
-                                np.nan,
-                            ),
-                            "z": metadata.get(
-                                "z",
-                                np.nan,
-                            ),
-                            "sph_theta": metadata.get(
-                                "sph_theta",
-                                np.nan,
-                            ),
-                            "sph_phi": metadata.get(
-                                "sph_phi",
-                                np.nan,
-                            ),
-                            "sph_radius": metadata.get(
-                                "sph_radius",
-                                np.nan,
-                            ),
-                            "theta": metadata.get(
-                                "theta",
-                                np.nan,
-                            ),
-                            "radius": metadata.get(
-                                "radius",
-                                np.nan,
-                            ),
-                            "channel_status": metadata.get(
-                                "status",
-                                np.nan,
-                            ),
-                            "channel_status_description": (
-                                metadata.get(
-                                    "status_description",
-                                    np.nan,
-                                )
-                            ),
-                            "time": times,
-                            "amplitude": amplitudes,
-                        }
+                    raise ValueError(
+                        "Amplitude count does not match exported "
+                        "time/channel rows for condition "
+                        f"{condition_number}, retained trial "
+                        f"{trial_index + 1}."
                     )
 
-                    all_rows.append(
-                        rows
-                    )
+                rows = pd.DataFrame(
+                    {
+                        "subject": subject,
+                        "analysis": analysis,
+                        "condition": condition_number,
+                        "condition_label": condition_label,
+                        "before_trial_rejection": before_trials,
+                        "after_trial_rejection_reported": (
+                            reported_retained_trials
+                        ),
+                        "after_trial_rejection_mat": (
+                            mat_retained_trials
+                        ),
+                        "trial": trial_index + 1,
+                        "retained_trial": int(
+                            lookup_row[
+                                "retained_trial"
+                            ]
+                        ),
+                        "urevent_index": int(
+                            lookup_row[
+                                "urevent_index"
+                            ]
+                        ),
+                        "epoch_id": lookup_row[
+                            "epoch_id"
+                        ],
+                        "channel": repeated_channel_metadata[
+                            "channel"
+                        ],
+                        "original_channel": repeated_channel_metadata[
+                            "original_channel"
+                        ],
+                        "electrode": repeated_channel_metadata[
+                            "electrode"
+                        ],
+                        "standard_label": repeated_channel_metadata[
+                            "standard_label"
+                        ],
+                        "x": repeated_channel_metadata[
+                            "x"
+                        ],
+                        "y": repeated_channel_metadata[
+                            "y"
+                        ],
+                        "z": repeated_channel_metadata[
+                            "z"
+                        ],
+                        "sph_theta": repeated_channel_metadata[
+                            "sph_theta"
+                        ],
+                        "sph_phi": repeated_channel_metadata[
+                            "sph_phi"
+                        ],
+                        "sph_radius": repeated_channel_metadata[
+                            "sph_radius"
+                        ],
+                        "theta": repeated_channel_metadata[
+                            "theta"
+                        ],
+                        "radius": repeated_channel_metadata[
+                            "radius"
+                        ],
+                        "channel_status": repeated_channel_metadata[
+                            "status"
+                        ],
+                        "channel_status_description": (
+                            repeated_channel_metadata[
+                                "status_description"
+                            ]
+                        ),
+                        "time": repeated_times,
+                        "amplitude": amplitudes,
+                    }
+                )
 
-        if not all_rows:
+                rows.to_csv(
+                    output_path,
+                    sep="\t",
+                    mode=(
+                        "w"
+                        if first_output_chunk
+                        else "a"
+                    ),
+                    header=first_output_chunk,
+                    index=False,
+                )
+
+                first_output_chunk = False
+                wrote_any_rows = True
+
+        if not wrote_any_rows:
             raise ValueError(
                 "No ERP rows were extracted from "
                 f"{mat_path.name}."
@@ -1291,11 +1334,6 @@ def export_long_for_file(
                 "No retained-trial lookup rows were created for "
                 f"{mat_path.name}."
             )
-
-        output_table = pd.concat(
-            all_rows,
-            ignore_index=True,
-        )
 
         trial_lookup_all = pd.concat(
             all_trial_lookups,
@@ -1336,43 +1374,11 @@ def export_long_for_file(
                 f"Examples: {examples}"
             )
 
-    output_dir.mkdir(
-        parents=True,
-        exist_ok=True,
-    )
-
-    safe_analysis = analysis.replace(
-        "/",
-        "_",
-    )
-
-    output_path = (
-        output_dir
-        / (
-            f"{subject}_erp-"
-            f"{safe_analysis}_long.tsv"
+        trial_lookup_all.to_csv(
+            lookup_path,
+            sep="\t",
+            index=False,
         )
-    )
-
-    lookup_path = (
-        output_dir
-        / (
-            f"{subject}_erp-"
-            f"{safe_analysis}_trial_lookup.tsv"
-        )
-    )
-
-    output_table.to_csv(
-        output_path,
-        sep="\t",
-        index=False,
-    )
-
-    trial_lookup_all.to_csv(
-        lookup_path,
-        sep="\t",
-        index=False,
-    )
 
     print(
         f"Saved ERP long file: {output_path}"
@@ -1392,13 +1398,6 @@ def discover_erp_mat_files(
     """
     Find ERP MAT files for the requested analyses.
 
-    Supports both:
-
-        erp_root/sub-01/sub-01_task-N400Stimset_erp-CP.mat
-
-    and:
-
-        erp_root/sub-01_task-N400Stimset_erp-CP.mat
     """
 
     mat_files = []
@@ -1559,7 +1558,7 @@ def main():
         "erp_root",
         help=(
             "ERP root folder containing sub-* subject "
-            "subfolders."
+            "subfolders, or one subject folder."
         ),
     )
 
@@ -1577,8 +1576,8 @@ def main():
         "--output-dir",
         default="eeg_outputs",
         help=(
-            "Directory where participant and combined ERP "
-            "TSV files will be saved."
+            "Directory where participant ERP TSV files "
+            "will be saved."
         ),
     )
 
@@ -1629,12 +1628,21 @@ def main():
 
     if not mat_files:
         searched_patterns = "\n".join(
-            str(
-                erp_root
-                / "sub-*"
-                / f"*_erp-{analysis}.mat"
-            )
-            for analysis in analyses
+            [
+                str(
+                    erp_root
+                    / "sub-*"
+                    / f"*_erp-{analysis}.mat"
+                )
+                for analysis in analyses
+            ]
+            + [
+                str(
+                    erp_root
+                    / f"*_erp-{analysis}.mat"
+                )
+                for analysis in analyses
+            ]
         )
 
         raise FileNotFoundError(
@@ -1757,49 +1765,6 @@ def main():
         raise RuntimeError(
             "No ERP MAT files were exported successfully."
         )
-
-    combined_path = (
-        output_dir
-        / "ALL_erp_long.tsv"
-    )
-
-    if combined_path.exists():
-        combined_path.unlink()
-
-    print(
-        "\nCombining exported TSV files in chunks..."
-    )
-
-    first_chunk = True
-
-    for output_path in output_files:
-        print(
-            f"  Adding: {output_path.name}"
-        )
-
-        for chunk in pd.read_csv(
-            output_path,
-            sep="\t",
-            chunksize=500_000,
-        ):
-            chunk.to_csv(
-                combined_path,
-                sep="\t",
-                mode=(
-                    "w"
-                    if first_chunk
-                    else "a"
-                ),
-                header=first_chunk,
-                index=False,
-            )
-
-            first_chunk = False
-
-    print(
-        "Saved combined ERP long file: "
-        f"{combined_path}"
-    )
 
     print(
         f"{len(output_files)} ERP MAT files "
