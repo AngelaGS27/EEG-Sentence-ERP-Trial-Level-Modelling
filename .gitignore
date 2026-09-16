@@ -32,7 +32,6 @@ env/
 
 language_outputs/
 language_outputs_old/
-limo_tools/
 eeg_outputs/
 analysis_optional/
 other_unrelated/
@@ -40,3 +39,6 @@ from_colab/
 erps_only_.mat/
 other_exclude_git/
 erp_glm_outputs.zip
+eeg_outputs.zip
+erp_analysis.ipynb
+stimuli_analysis.ipynb
