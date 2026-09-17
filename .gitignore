@@ -41,4 +41,5 @@ other_exclude_git/
 erp_glm_outputs.zip
 eeg_outputs.zip
 erp_analysis.ipynb
+erp_analysis(1).ipynb
 stimuli_analysis.ipynb
