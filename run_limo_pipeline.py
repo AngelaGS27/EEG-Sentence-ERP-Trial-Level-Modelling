@@ -1755,6 +1755,8 @@ def run_matlab(
     subprocess.run(
         [
             matlab,
+            "-licmode",
+            "onlinelicensing",
             "-batch",
             command,
         ],
